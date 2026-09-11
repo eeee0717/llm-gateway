@@ -1,0 +1,14 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose # 转发代码到处是 http.Response，漏关 Body 会泄漏连接
+    - errorlint # 错误判断统一用 errors.Is / errors.As
+    - noctx # 发往上游的请求必须带 context，才能随调用方一起取消
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - bodyclose # 测试里的响应体统一由 t.Cleanup 关闭，bodyclose 看不出来
