@@ -1,0 +1,11 @@
+# 构建与测试产物
+/bin/
+/dist/
+*.test
+coverage.out
+
+# 本地环境与 agent 协作目录
+.env
+/.context/
+
+.DS_Store
