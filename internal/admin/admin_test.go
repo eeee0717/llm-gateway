@@ -122,6 +122,9 @@ func TestAdminRejectsBadKeyIDs(t *testing.T) {
 
 	require.Equal(t, http.StatusNotFound, a.get(t, "/admin/keys/999999999", adminKey).StatusCode)
 	require.Equal(t, http.StatusBadRequest, a.get(t, "/admin/keys/abc", adminKey).StatusCode)
+	// 改余额的两个接口同样要认出"这个 Key 不存在"，而不是当成改了零行就算成功
+	require.Equal(t, http.StatusNotFound, a.post(t, "/admin/keys/999999999/credit", `{"amount_micro":1}`, adminKey).StatusCode)
+	require.Equal(t, http.StatusNotFound, a.post(t, "/admin/keys/999999999/disable", ``, adminKey).StatusCode)
 }
 
 func TestCreditRequiresAPositiveAmount(t *testing.T) {
