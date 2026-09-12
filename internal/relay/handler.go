@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -25,6 +26,9 @@ const (
 	maxRequestBytes = 20 << 20
 	// maxErrorBytes 是读取上游错误响应体的上限。正常的错误响应只有几百字节。
 	maxErrorBytes = 64 << 10
+	// billingTimeout 是预扣和结算各自的超时。两者都不跟着调用方一起取消，但必须有上限：
+	// 数据库卡住时，每个请求都占着连接池里的一条连接不放，整个实例很快就没有连接可用了。
+	billingTimeout = 5 * time.Second
 )
 
 // Reservation 是预扣所需的信息：一次请求最多可能花多少钱，由它算出来。
@@ -47,8 +51,9 @@ type Result struct {
 type Biller interface {
 	// Reserve 在转发之前预扣最大可能的费用，返回预扣的金额。
 	// ok 为 false 表示余额不够或者 Key 被禁用，这次请求不该转发；err 只表示系统故障，例如数据库连不上。
+	// 传进来的 ctx 不会随请求取消，只带超时：预扣要么成功要么失败，不能停在"不知道扣没扣"的状态上。
 	Reserve(ctx context.Context, r Reservation) (reserved int64, ok bool, err error)
-	// Settle 结算一次请求。调用方可能已经断开，传进来的 ctx 不会随请求取消。
+	// Settle 结算一次请求。调用方可能已经断开，传进来的 ctx 同样不随请求取消，只带超时。
 	Settle(ctx context.Context, r Result) error
 }
 
@@ -114,12 +119,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	m := newMeter(req.Messages)
-	reserved, ok, err := h.biller.Reserve(ctx, Reservation{
+	m := newMeter(req)
+	// 预扣不跟着调用方一起取消：那条 UPDATE 可能已经在数据库里提交了，网关却只收到一个"已取消"，
+	// 这时它分不清钱扣没扣，也就没法退回去。
+	reserveCtx, cancelReserve := context.WithTimeout(context.WithoutCancel(ctx), billingTimeout)
+	reserved, ok, err := h.biller.Reserve(reserveCtx, Reservation{
 		Model:           req.Model,
 		PromptTokens:    m.promptTokens(),
 		MaxOutputTokens: maxOutput,
 	})
+	cancelReserve()
 	switch {
 	case err != nil:
 		h.logger.ErrorContext(ctx, "reserve failed", "error", err)
@@ -143,7 +152,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			ReservedMicro: reserved,
 		}
 		// 调用方可能已经断开，结算不能随请求一起取消
-		if err := h.biller.Settle(context.WithoutCancel(ctx), result); err != nil {
+		settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), billingTimeout)
+		defer cancel()
+		if err := h.biller.Settle(settleCtx, result); err != nil {
 			// 结算失败时预扣还挂在余额上，日志要带够对账用的信息
 			h.logger.ErrorContext(ctx, "settle failed",
 				"error", err,
@@ -155,6 +166,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			)
 		}
 	}()
+	if ctx.Err() != nil {
+		return // 调用方在预扣期间断开，上面的 defer 会把预扣退回去
+	}
 	upstreamFailed = h.forward(c, rt, body, req, m)
 }
 

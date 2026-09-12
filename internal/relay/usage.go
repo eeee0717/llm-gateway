@@ -14,10 +14,15 @@ type meter struct {
 	completion charCount
 }
 
-func newMeter(messages []openai.Message) *meter {
+func newMeter(req openai.ChatRequest) *meter {
 	m := &meter{}
-	for _, msg := range messages {
+	for _, msg := range req.Messages {
 		m.prompt.addMessage(msg)
+	}
+	// 工具定义和消息一起送给模型，同样按 prompt 收费，函数调用的请求里它往往比消息本身还长。
+	// 这里数的是原始 JSON 的字符，比模型实际看到的多出一些标点，估算偏高好过偏低。
+	for _, tool := range req.Tools {
+		m.prompt.add(string(tool))
 	}
 	return m
 }

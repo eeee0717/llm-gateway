@@ -37,8 +37,12 @@ type ChatRequest struct {
 	Model         string         `json:"model"`
 	Stream        bool           `json:"stream"`
 	StreamOptions *StreamOptions `json:"stream_options"`
-	MaxTokens     *int           `json:"max_tokens"` // 输出上限；调用方没指定时为 nil，网关补上模型的默认值
-	Messages      []Message      `json:"messages"`
+	// 输出上限的两种写法，调用方都没指定时为 nil，网关补上模型的默认值。
+	MaxTokens           *int      `json:"max_tokens"`
+	MaxCompletionTokens *int      `json:"max_completion_tokens"`
+	Messages            []Message `json:"messages"`
+	// Tools 是工具定义，网关不解析它，只按原始 JSON 的长度把它计入 prompt 的估算。
+	Tools []json.RawMessage `json:"tools"`
 }
 
 // StreamOptions 是流式请求的选项。IncludeUsage 为 true 时，上游在流的末尾多发一个只含 usage 的事件。
@@ -46,12 +50,17 @@ type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
 }
 
-// OutputLimit 返回请求指定的输出上限。没指定或者填了个不合法的值时返回 0，由网关补上模型的默认值。
+// OutputLimit 返回请求指定的输出上限。两种字段名都要认：max_completion_tokens 是 OpenAI 现在的写法，
+// max_tokens 是它取代的旧写法，同时出现时以新的为准。漏认一种，网关就会以为调用方没指定，
+// 按模型的默认值预扣，而上游按调用方要的生成，预扣就兜不住实际费用了。
+// 没指定或者填了个不合法的值时返回 0，由网关补上模型的默认值。
 func (r ChatRequest) OutputLimit() int {
-	if r.MaxTokens == nil || *r.MaxTokens <= 0 {
-		return 0
+	for _, limit := range []*int{r.MaxCompletionTokens, r.MaxTokens} {
+		if limit != nil && *limit > 0 {
+			return *limit
+		}
 	}
-	return *r.MaxTokens
+	return 0
 }
 
 // IncludeUsage 表示请求是否要求在流里报告用量。

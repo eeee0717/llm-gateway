@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -125,6 +127,40 @@ func TestCallerDisconnectBeforeResponseCancelsUpstreamAndEstimatesPrompt(t *test
 	result := gw.biller.next(t)
 	require.True(t, result.Estimated)
 	require.Equal(t, openai.Usage{PromptTokens: 2, CompletionTokens: 0}, result.Usage)
+}
+
+// 预扣不跟着调用方一起取消。条件 UPDATE 可能已经在数据库里提交，网关收到的却是"context 被取消"，
+// 这时它分不清钱扣没扣，那笔预扣也就没人退回；结算同理，调用方断开之后照样要写完。
+// 两者都带超时：数据库卡住时，请求不能一直占着连接池里的一条连接。
+func TestBillingIsIsolatedFromCallerCancellation(t *testing.T) {
+	gw := startGateway(t, map[string]http.Handler{"mock-model": mockupstream.New(mockupstream.Options{Tokens: 1})})
+	gw.biller.holdReserve = make(chan struct{})
+	release := sync.OnceFunc(func() { close(gw.biller.holdReserve) })
+	t.Cleanup(release) // 断言失败时也要放行，否则网关停在预扣里，测试收尾时关不掉
+	ctx, disconnect := context.WithCancel(t.Context())
+	req := gw.request(t, ctx, `{"model":"mock-model",`+helloMessages+`}`)
+
+	go func() {
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	callerCtx := <-gw.requests
+	reserveCtx := gw.biller.nextContext(t) // 预扣已经开始，它会停在 holdReserve 上
+	disconnect()
+	require.Eventually(t, func() bool { return callerCtx.Err() != nil }, 5*time.Second, 10*time.Millisecond)
+
+	require.NoError(t, reserveCtx.Err()) // 调用方已经断开，预扣照样有结果
+	release()
+	require.True(t, gw.biller.next(t).Estimated) // 断开之后照样结算，用量只能估算
+	requireHasDeadline(t, reserveCtx)
+	requireHasDeadline(t, gw.biller.nextContext(t)) // 结算
+}
+
+func requireHasDeadline(t *testing.T, ctx context.Context) {
+	t.Helper()
+	_, ok := ctx.Deadline()
+	require.True(t, ok, "计费的 context 应该带超时")
 }
 
 // M1 收口断言：上游中途出错时，调用方收到错误事件，已转发的部分按估算用量结算。
@@ -284,22 +320,37 @@ func TestFillsInTheModelDefaultOutputLimit(t *testing.T) {
 
 	gw.post(t, t.Context(), `{"model":"mock-model",`+helloMessages+`}`)
 
-	require.Equal(t, defaultMaxTokens, maxTokensIn(t, <-upstream.bodies))
+	require.Equal(t, defaultMaxTokens, outputLimitIn(t, <-upstream.bodies))
 	reservation := gw.biller.nextReservation(t)
 	require.Equal(t, "mock-model", reservation.Model)
 	require.Equal(t, defaultMaxTokens, reservation.MaxOutputTokens)
 	require.Equal(t, 2, reservation.PromptTokens) // "hello" 估算出 2 个 token
 }
 
-// 调用方自己指定了输出上限就按它预扣，请求体不改。
+// 调用方自己指定了输出上限就按它预扣，请求体不改。两种字段名都要认：OpenAI 新协议用
+// max_completion_tokens，漏认的话网关会以为没指定，按模型默认值预扣，而上游按调用方要的生成，预扣就兜不住了。
 func TestUsesTheCallerOutputLimitForReserve(t *testing.T) {
-	upstream := &recordingUpstream{bodies: make(chan []byte, 1)}
-	gw := startGateway(t, map[string]http.Handler{"mock-model": upstream})
+	for _, field := range []string{"max_tokens", "max_completion_tokens"} {
+		t.Run(field, func(t *testing.T) {
+			upstream := &recordingUpstream{bodies: make(chan []byte, 1)}
+			gw := startGateway(t, map[string]http.Handler{"mock-model": upstream})
 
-	gw.post(t, t.Context(), `{"model":"mock-model","max_tokens":50,`+helloMessages+`}`)
+			gw.post(t, t.Context(), fmt.Sprintf(`{"model":"mock-model","%s":50,%s}`, field, helloMessages))
 
-	require.Equal(t, 50, maxTokensIn(t, <-upstream.bodies))
-	require.Equal(t, 50, gw.biller.nextReservation(t).MaxOutputTokens)
+			require.Equal(t, 50, outputLimitIn(t, <-upstream.bodies))
+			require.Equal(t, 50, gw.biller.nextReservation(t).MaxOutputTokens)
+		})
+	}
+}
+
+// 函数调用的请求里，tools 的定义往往比消息本身还长，不计入的话预扣会系统性偏低。
+func TestCountsToolDefinitionsInPromptEstimate(t *testing.T) {
+	gw := startGateway(t, map[string]http.Handler{"mock-model": mockupstream.New(mockupstream.Options{Tokens: 1})})
+	tools := `"tools":[{"type":"function","function":{"name":"get_weather","description":"look up the weather"}}]`
+
+	gw.post(t, t.Context(), `{"model":"mock-model",`+tools+`,`+helloMessages+`}`)
+
+	require.Greater(t, gw.biller.nextReservation(t).PromptTokens, 2) // 只数消息时是 2
 }
 
 // 预扣的金额要原样带到结算，结算才知道该退多少。
@@ -386,13 +437,17 @@ func (u *recordingUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
 }
 
-// maxTokensIn 取出发给上游的请求里的输出上限。
-func maxTokensIn(t *testing.T, body []byte) int {
+// outputLimitIn 取出发给上游的请求里的输出上限，两种字段名都认。
+func outputLimitIn(t *testing.T, body []byte) int {
 	t.Helper()
 	var sent struct {
-		MaxTokens int `json:"max_tokens"`
+		MaxTokens           int `json:"max_tokens"`
+		MaxCompletionTokens int `json:"max_completion_tokens"`
 	}
 	require.NoError(t, json.Unmarshal(body, &sent))
+	if sent.MaxCompletionTokens != 0 {
+		return sent.MaxCompletionTokens
+	}
 	return sent.MaxTokens
 }
 
@@ -459,21 +514,42 @@ func usageEventsIn(t *testing.T, events []string) int {
 }
 
 // recordingBiller 记下每次预扣和结算收到的内容。reserveOK 置为 false 就是余额不够。
+// contexts 收下预扣和结算各自拿到的 context，用来检查它们和调用方的断开是隔离的。
+// holdReserve 非 nil 时，预扣会一直等到它被关闭，好让测试在预扣进行中做事。
 type recordingBiller struct {
 	reservations chan relay.Reservation
 	results      chan relay.Result
+	contexts     chan context.Context
+	holdReserve  chan struct{}
 	reserveOK    atomic.Bool
 	reserved     atomic.Int64
 }
 
-func (b *recordingBiller) Reserve(_ context.Context, r relay.Reservation) (int64, bool, error) {
+func (b *recordingBiller) Reserve(ctx context.Context, r relay.Reservation) (int64, bool, error) {
 	b.reservations <- r
+	b.contexts <- ctx
+	if b.holdReserve != nil {
+		<-b.holdReserve
+	}
 	return b.reserved.Load(), b.reserveOK.Load(), nil
 }
 
-func (b *recordingBiller) Settle(_ context.Context, r relay.Result) error {
+func (b *recordingBiller) Settle(ctx context.Context, r relay.Result) error {
 	b.results <- r
+	b.contexts <- ctx
 	return nil
+}
+
+// nextContext 取出预扣或结算拿到的 context，顺序和它们被调用的顺序一致。
+func (b *recordingBiller) nextContext(t *testing.T) context.Context {
+	t.Helper()
+	select {
+	case ctx := <-b.contexts:
+		return ctx
+	case <-time.After(5 * time.Second):
+		t.Fatal("5 秒内没有发生计费")
+		return nil
+	}
 }
 
 // next 等待下一次结算。结算发生在转发结束之后；调用方中途断开时，还要等网关察觉断开。
@@ -503,6 +579,8 @@ func (b *recordingBiller) nextReservation(t *testing.T) relay.Reservation {
 type gateway struct {
 	url    string
 	biller *recordingBiller
+	// requests 收下服务端看到的每个请求的 context，测试用它确认"调用方已经断开"。
+	requests chan context.Context
 }
 
 // startGateway 起一个网关。models 把模型名映射到服务它的上游（通常是 mock），每个 handler 单独算一个上游。
@@ -520,17 +598,23 @@ func startGateway(t *testing.T, models map[string]http.Handler) *gateway {
 	biller := &recordingBiller{
 		reservations: make(chan relay.Reservation, 10),
 		results:      make(chan relay.Result, 10),
+		contexts:     make(chan context.Context, 10),
 	}
 	biller.reserveOK.Store(true)
-	srv := httptest.NewServer(server.New(logger, relay.New(cfg, biller, logger), stubAuth))
+	requests := make(chan context.Context, 10)
+	srv := httptest.NewServer(server.New(logger, relay.New(cfg, biller, logger), stubAuth(requests)))
 	t.Cleanup(srv.Close)
-	return &gateway{url: srv.URL, biller: biller}
+	return &gateway{url: srv.URL, biller: biller, requests: requests}
 }
 
 // stubAuth 顶替鉴权中间件：relay 的测试不连数据库，只要 context 里有一个 Key ID 就行。
-func stubAuth(c *gin.Context) {
-	c.Request = c.Request.WithContext(apikey.NewContext(c.Request.Context(), 1))
-	c.Next()
+func stubAuth(requests chan<- context.Context) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx := apikey.NewContext(c.Request.Context(), 1)
+		c.Request = c.Request.WithContext(ctx)
+		requests <- ctx
+		c.Next()
+	}
 }
 
 // post 以调用方的身份发一个聊天请求；取消 ctx 就是调用方中途断开。
