@@ -144,7 +144,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		// 调用方可能已经断开，结算不能随请求一起取消
 		if err := h.biller.Settle(context.WithoutCancel(ctx), result); err != nil {
-			h.logger.ErrorContext(ctx, "settle failed", "error", err)
+			// 结算失败时预扣还挂在余额上，日志要带够对账用的信息
+			h.logger.ErrorContext(ctx, "settle failed",
+				"error", err,
+				"model", result.Model,
+				"reserved_micro", result.ReservedMicro,
+				"prompt_tokens", result.Usage.PromptTokens,
+				"completion_tokens", result.Usage.CompletionTokens,
+				"estimated", result.Estimated,
+			)
 		}
 	}()
 	upstreamFailed = h.forward(c, rt, body, req, m)
