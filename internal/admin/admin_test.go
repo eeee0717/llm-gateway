@@ -1,6 +1,7 @@
 package admin_test
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -41,20 +42,36 @@ func TestCreateKeyReturnsThePlainKeyOnce(t *testing.T) {
 func TestAdminRejectsRequestsWithoutTheAdminKey(t *testing.T) {
 	a := startAdmin(t)
 
+	name := rand.Text() // 库是所有测试共用的，名字取唯一的，下面才数得准
+
 	for _, tc := range []struct{ name, key string }{
 		{"no key", ""},
 		{"wrong key", "admin-wrong"},
 		{"api key instead of admin key", "sk-caller-key"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := a.post(t, "/admin/keys", `{"name":"mallory"}`, tc.key)
+			resp := a.post(t, "/admin/keys", `{"name":"`+name+`"}`, tc.key)
 			require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 		})
 	}
 
-	var count int64
-	require.NoError(t, a.db.Raw(`SELECT count(*) FROM api_keys WHERE name = ?`, "mallory").Scan(&count).Error)
-	require.Zero(t, count) // 鉴权不通过时不会建出 Key
+	require.Zero(t, countKeysNamed(t, a, name)) // 鉴权不通过时不会建出 Key
+}
+
+// Authorization 头必须写成 Bearer 形式，裸密钥不算数：协议只有一种写法，鉴权就只认一种。
+func TestAdminRequiresTheBearerScheme(t *testing.T) {
+	a := startAdmin(t)
+	name := rand.Text()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, a.url+"/admin/keys", strings.NewReader(`{"name":"`+name+`"}`))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", adminKey) // 密钥对，但没有 Bearer 前缀
+
+	resp, err := http.DefaultClient.Do(req)
+
+	require.NoError(t, err)
+	t.Cleanup(func() { resp.Body.Close() })
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	require.Zero(t, countKeysNamed(t, a, name))
 }
 
 func TestCreateKeyRequiresName(t *testing.T) {
@@ -130,6 +147,13 @@ func decodeKey(t *testing.T, resp *http.Response) keyView {
 	var view keyView
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&view))
 	return view
+}
+
+func countKeysNamed(t *testing.T, a *adminServer, name string) int64 {
+	t.Helper()
+	var count int64
+	require.NoError(t, a.db.Raw(`SELECT count(*) FROM api_keys WHERE name = ?`, name).Scan(&count).Error)
+	return count
 }
 
 type adminServer struct {

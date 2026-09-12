@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -98,6 +99,9 @@ func openDB(dsn string) (*gorm.DB, error) {
 	// 并发再高也只是在这 20 条上排队，预扣本来就是同一行上的串行操作。
 	db.SetMaxOpenConns(20)
 	db.SetMaxIdleConns(10)
+	// 连接用满一小时就换掉：数据库重启、主从切换或者中间的连接跟踪超时后，
+	// 池子里可能留着一批已经不通的连接，靠它们自然轮换掉。
+	db.SetConnMaxLifetime(time.Hour)
 	return gdb, nil
 }
 

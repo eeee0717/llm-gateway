@@ -199,10 +199,14 @@ func keyWithBalance(t *testing.T, db *gorm.DB, balance int64) (context.Context, 
 	return apikey.NewContext(t.Context(), key.ID), key.ID
 }
 
+// balanceOf 查一个 Key 的余额。查不到行时 Scan 不报错、balance 留在零值，所以这里要看行数：
+// 否则"Key 被删了"和"余额是 0"分不开。
 func balanceOf(t *testing.T, db *gorm.DB, keyID int64) int64 {
 	t.Helper()
 	var balance int64
-	require.NoError(t, db.Raw(`SELECT balance_micro FROM api_keys WHERE id = ?`, keyID).Scan(&balance).Error)
+	res := db.Raw(`SELECT balance_micro FROM api_keys WHERE id = ?`, keyID).Scan(&balance)
+	require.NoError(t, res.Error)
+	require.EqualValues(t, 1, res.RowsAffected, "api key %d not found", keyID)
 	return balance
 }
 

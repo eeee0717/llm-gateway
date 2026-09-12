@@ -27,12 +27,13 @@ func New(logger *slog.Logger, keys *apikey.Store) *Handler {
 	return &Handler{keys: keys, logger: logger}
 }
 
-// Auth 校验管理员密钥。比较用固定时间，避免按耗时逐字节猜出密钥。
+// Auth 校验管理员密钥。Authorization 头必须写成 Bearer 形式，裸密钥不算数。
+// 密钥本身的比较用固定时间，避免按耗时逐字节猜出密钥。
 func Auth(adminKey string) gin.HandlerFunc {
 	want := []byte(adminKey)
 	return func(c *gin.Context) {
-		got := []byte(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
-		if subtle.ConstantTimeCompare(got, want) != 1 {
+		got, ok := strings.CutPrefix(c.GetHeader("Authorization"), "Bearer ")
+		if !ok || subtle.ConstantTimeCompare([]byte(got), want) != 1 {
 			c.AbortWithStatusJSON(http.StatusUnauthorized,
 				openai.NewError(openai.TypeInvalidRequest, "invalid_admin_key", "invalid admin key"))
 			return

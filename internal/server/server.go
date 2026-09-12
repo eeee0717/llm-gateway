@@ -91,9 +91,14 @@ func Run(ctx context.Context, logger *slog.Logger, listeners ...Listener) error 
 	}
 	logger.Info("shutting down")
 	if e := shutdown(servers, shutdownTimeout); e != nil {
-		logger.Warn("shutdown timed out, canceling in-flight requests", "error", e)
-		cancelRequests()
-		_ = shutdown(servers, settleGrace)
+		// 只有超时才值得取消进行中的请求；其他错误（比如关监听失败）再等一轮也没用
+		if errors.Is(e, context.DeadlineExceeded) {
+			logger.Warn("shutdown timed out, canceling in-flight requests", "error", e)
+			cancelRequests()
+			_ = shutdown(servers, settleGrace)
+		} else {
+			logger.Warn("shutdown failed", "error", e)
+		}
 		if err == nil {
 			err = e
 		}
