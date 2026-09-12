@@ -23,26 +23,31 @@ import (
 
 const adminKey = "admin-secret"
 
+// 一次请求的两个金额。消息只有 1 个字符，网关估算和 mock 上游报告的 prompt token 都是 1；
+// 模型的默认输出上限是 5，而 mock 只回 3 个 token，所以每次结算都要退回 16 微元的差额。
+const (
+	reservedPerRequest = 1*2 + 5*8 // 转发前按输出上限预扣
+	costPerRequest     = 1*2 + 3*8 // 结束后按实际用量结算
+)
+
 // M2 收口断言：两个网关实例共用一套 PostgreSQL，1000 个并发请求打同一个 API Key，余额零超扣。
 //
-// 每个请求的费用是确定的：消息只有 1 个字符，网关估算和 mock 上游报告的 prompt token 都是 1；
-// 模型的默认输出上限是 5，mock 正好回 5 个 token，所以预扣和实际费用都是 1×2 + 5×8 = 42 微元。
-// 余额只够 500 次，因此成功的次数必须正好是 500，最后余额必须正好是 0：
-// 少扣会剩下钱，超扣会变成负数，两种都说明并发下的预扣出了问题。
+// 余额只够预扣 500 次。退回的差额会让后面的请求又扣得下，所以成功的次数不是一个定值，
+// 但有两条性质必须成立：余额不能变成负数（零超扣），而且余额加上所有用量记录的费用必须正好等于充值额
+// （账目守恒）。少退、多退、重复结算都会破坏守恒，扣穿会破坏前一条。
 func TestTwoInstancesDoNotOverspendOneKey(t *testing.T) {
 	const (
-		requests       = 1000
-		affordable     = 500
-		costPerRequest = 42
+		requests = 1000
+		credited = 500 * reservedPerRequest
 	)
 	db := testdb.New(t) // 顺带把迁移跑好
 	logger := slog.New(slog.DiscardHandler)
-	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 5}))
+	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
 	t.Cleanup(upstream.Close)
 	cfg := testConfig(upstream.URL)
 
 	first, second := startInstance(t, cfg, logger), startInstance(t, cfg, logger)
-	key, keyID := createKey(t, first, affordable*costPerRequest)
+	key, keyID := createKey(t, first, credited)
 
 	var succeeded, rejected, unexpected atomic.Int64
 	var wg sync.WaitGroup
@@ -67,22 +72,29 @@ func TestTwoInstancesDoNotOverspendOneKey(t *testing.T) {
 	wg.Wait()
 
 	require.Zero(t, unexpected.Load()) // 每个请求要么成功，要么因为余额不够被拒
-	require.EqualValues(t, affordable, succeeded.Load())
-	require.EqualValues(t, requests-affordable, rejected.Load())
+	require.EqualValues(t, requests, succeeded.Load()+rejected.Load())
 
-	require.Zero(t, balanceOf(t, db, keyID))
+	balance := balanceOf(t, db, keyID)
 	records, cost := usageOf(t, db, keyID)
-	require.EqualValues(t, affordable, records) // 每个成功的请求留下一条用量记录
-	require.EqualValues(t, affordable*costPerRequest, cost)
+	require.GreaterOrEqual(t, balance, int64(0))         // 零超扣
+	require.EqualValues(t, credited, balance+cost)       // 账目守恒
+	require.EqualValues(t, succeeded.Load(), records)    // 每个成功的请求留下一条用量记录
+	require.EqualValues(t, records*costPerRequest, cost) // 每条记录的费用都是实际用量算出来的
+
+	// 成功的次数落在一个算得出来的区间里：最少是按预扣金额能支付的次数（退款一次都还没发生），
+	// 最多是按实际费用能支付的次数（每次预扣之前差额都已经退回来了）。
+	require.GreaterOrEqual(t, succeeded.Load(), int64(credited/reservedPerRequest))
+	require.LessOrEqual(t, succeeded.Load(), int64(credited/costPerRequest))
 }
 
 // 流式请求同样走预扣和结算，用量取上游在流末尾报告的那份。
 func TestStreamingRequestIsBilledFromUpstreamUsage(t *testing.T) {
+	const credited = 1_000_000
 	db := testdb.New(t)
-	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 5}))
+	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
 	t.Cleanup(upstream.Close)
 	gw := startInstance(t, testConfig(upstream.URL), slog.New(slog.DiscardHandler))
-	key, keyID := createKey(t, gw, 1_000_000)
+	key, keyID := createKey(t, gw, credited)
 
 	status, body := chatStream(t, gw.business, key)
 
@@ -91,8 +103,8 @@ func TestStreamingRequestIsBilledFromUpstreamUsage(t *testing.T) {
 	require.Contains(t, body, "[DONE]")
 	records, cost := usageOf(t, db, keyID)
 	require.EqualValues(t, 1, records)
-	require.EqualValues(t, 42, cost) // 1 个 prompt token × 2 + 5 个 completion token × 8
-	require.EqualValues(t, 1_000_000-42, balanceOf(t, db, keyID))
+	require.EqualValues(t, costPerRequest, cost) // 按实际用量，不是按预扣的输出上限
+	require.EqualValues(t, credited-costPerRequest, balanceOf(t, db, keyID))
 }
 
 // instance 是一个网关实例的两个端口。
