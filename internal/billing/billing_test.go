@@ -124,6 +124,38 @@ func TestSettleChargesMoreThanReservedWhenPromptWasUnderestimated(t *testing.T) 
 	require.EqualValues(t, -1_700, balanceOf(t, db, keyID))
 }
 
+// 结算是同步做的，它的耗时直接加在每个请求的延迟上，所以单独量一下。
+func BenchmarkReserveAndSettle(b *testing.B) {
+	db := testdb.New(b)
+	svc := billing.New(slog.New(slog.DiscardHandler), db, prices)
+	_, hash := apikey.Generate()
+	key, err := apikey.NewStore(db).Create(b.Context(), "benchmark", hash)
+	require.NoError(b, err)
+	require.NoError(b, db.Exec(`UPDATE api_keys SET balance_micro = ? WHERE id = ?`, int64(1)<<40, key.ID).Error)
+	ctx := apikey.NewContext(b.Context(), key.ID)
+
+	b.Run("reserve", func(b *testing.B) {
+		for b.Loop() {
+			if _, _, err := svc.Reserve(ctx, reservation); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("settle", func(b *testing.B) {
+		for b.Loop() {
+			err := svc.Settle(ctx, relay.Result{
+				RequestID:     rand.Text(),
+				Model:         "mock-model",
+				Usage:         openai.Usage{PromptTokens: 1, CompletionTokens: 5},
+				ReservedMicro: 42,
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func newService(t *testing.T) (*billing.Service, *gorm.DB) {
 	t.Helper()
 	db := testdb.New(t)
