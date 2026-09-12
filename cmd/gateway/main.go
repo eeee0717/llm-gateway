@@ -125,17 +125,29 @@ func serve(args []string) error {
 // build 组装两个端口的处理器。所有依赖都在这里接起来，测试也用它，测的就是真正跑起来的那套装配。
 func build(cfg *config.Config, db *gorm.DB, logger *slog.Logger) (business, management http.Handler) {
 	keys := apikey.NewStore(db)
-	rh := relay.New(cfg, billing.New(logger, db, prices(cfg)), logger)
+	rh := relay.New(cfg, biller{billing.New(db, prices(cfg))}, logger)
 	ah := admin.New(logger, keys)
 	return server.New(logger, rh, apikey.Middleware(logger, keys)),
 		server.NewAdmin(logger, ah, admin.Auth(cfg.Admin.Key))
+}
+
+// biller 把 billing.Service 接到 relay.Biller 上。两个包各自定义自己的类型，谁也不 import 谁，
+// 转换放在这里：两边的字段一样，直接转就行，哪天对不上了就是一个编译错误。
+type biller struct{ svc *billing.Service }
+
+func (b biller) Reserve(ctx context.Context, r relay.Reservation) (int64, bool, error) {
+	return b.svc.Reserve(ctx, billing.Reservation(r))
+}
+
+func (b biller) Settle(ctx context.Context, r relay.Result) error {
+	return b.svc.Settle(ctx, billing.Result(r))
 }
 
 // prices 把配置里每个模型的单价整理成计费用的表。
 func prices(cfg *config.Config) map[string]billing.Price {
 	p := make(map[string]billing.Price, len(cfg.Models))
 	for _, m := range cfg.Models {
-		p[m.Name] = billing.Price{Input: m.InputPrice, Output: m.OutputPrice}
+		p[m.Name] = billing.PricePerMillionTokens(m.InputPrice, m.OutputPrice)
 	}
 	return p
 }

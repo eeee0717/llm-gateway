@@ -3,7 +3,7 @@ package billing_test
 import (
 	"context"
 	"crypto/rand"
-	"log/slog"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -12,15 +12,14 @@ import (
 	"github.com/eeee0717/llm-gateway/internal/apikey"
 	"github.com/eeee0717/llm-gateway/internal/billing"
 	"github.com/eeee0717/llm-gateway/internal/openai"
-	"github.com/eeee0717/llm-gateway/internal/relay"
 	"github.com/eeee0717/llm-gateway/internal/testdb"
 )
 
-// mock-model 的单价：输入 2、输出 3（元/百万 token，正好等于微元/token）。
-var prices = map[string]billing.Price{"mock-model": {Input: 2, Output: 3}}
+// mock-model 的单价：输入 2、输出 3 元每百万 token，正好等于 2 微元和 3 微元每 token。
+var prices = map[string]billing.Price{"mock-model": billing.PricePerMillionTokens(2, 3)}
 
 // reservation 是测试里反复用的一次预扣：估算 100 个 prompt token，输出上限 1000，最大费用 3200 微元。
-var reservation = relay.Reservation{Model: "mock-model", PromptTokens: 100, MaxOutputTokens: 1000}
+var reservation = billing.Reservation{Model: "mock-model", PromptTokens: 100, MaxOutputTokens: 1000}
 
 func TestReserveTakesTheMaximumPossibleCost(t *testing.T) {
 	svc, db := newService(t)
@@ -57,6 +56,34 @@ func TestReserveRejectsDisabledKey(t *testing.T) {
 	require.EqualValues(t, 10_000, balanceOf(t, db, keyID))
 }
 
+// 单价常有小数，费用要按整数算：0.14 元每百万 token 就是每 token 0.14 微元，
+// 50 个 token 正好 7 微元，用 float64 相乘会得到 7.000000000000001，向上取整就多收 1 微元。
+func TestCostIsExactWhenPriceHasDecimals(t *testing.T) {
+	db := testdb.New(t)
+	svc := billing.New(db, map[string]billing.Price{"cheap": billing.PricePerMillionTokens(0.14, 0.28)})
+	ctx, _ := keyWithBalance(t, db, 10_000)
+
+	reserved, ok, err := svc.Reserve(ctx, billing.Reservation{Model: "cheap", PromptTokens: 50, MaxOutputTokens: 50})
+
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.EqualValues(t, 21, reserved) // 50×0.14 + 50×0.28，浮点算出来是 22
+}
+
+// 请求 ID 是结算的幂等键。空的话所有请求会撞在同一个主键上，只有第一个能结算，
+// 其余的预扣都退不回来，所以宁可报错。
+func TestSettleRejectsAnEmptyRequestID(t *testing.T) {
+	svc, db := newService(t)
+	ctx, keyID := keyWithBalance(t, db, 10_000)
+	reserved, _, err := svc.Reserve(ctx, reservation)
+	require.NoError(t, err)
+
+	err = svc.Settle(ctx, billing.Result{Model: "mock-model", ReservedMicro: reserved})
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), fmt.Sprint(keyID)) // 对账要知道是哪个 Key 的钱挂住了
+}
+
 func TestSettleRefundsTheDifferenceAndRecordsUsage(t *testing.T) {
 	svc, db := newService(t)
 	ctx, keyID := keyWithBalance(t, db, 10_000)
@@ -64,7 +91,7 @@ func TestSettleRefundsTheDifferenceAndRecordsUsage(t *testing.T) {
 	require.NoError(t, err)
 	requestID := rand.Text()
 
-	err = svc.Settle(ctx, relay.Result{
+	err = svc.Settle(ctx, billing.Result{
 		RequestID:     requestID,
 		Model:         "mock-model",
 		Usage:         openai.Usage{PromptTokens: 100, CompletionTokens: 10},
@@ -90,7 +117,7 @@ func TestSettleTwiceChargesOnce(t *testing.T) {
 	ctx, keyID := keyWithBalance(t, db, 10_000)
 	reserved, _, err := svc.Reserve(ctx, reservation)
 	require.NoError(t, err)
-	result := relay.Result{
+	result := billing.Result{
 		RequestID:     rand.Text(),
 		Model:         "mock-model",
 		Usage:         openai.Usage{PromptTokens: 100, CompletionTokens: 10},
@@ -108,11 +135,11 @@ func TestSettleTwiceChargesOnce(t *testing.T) {
 func TestSettleChargesMoreThanReservedWhenPromptWasUnderestimated(t *testing.T) {
 	svc, db := newService(t)
 	ctx, keyID := keyWithBalance(t, db, 3_300)
-	reserved, ok, err := svc.Reserve(ctx, relay.Reservation{Model: "mock-model", PromptTokens: 0, MaxOutputTokens: 1000})
+	reserved, ok, err := svc.Reserve(ctx, billing.Reservation{Model: "mock-model", PromptTokens: 0, MaxOutputTokens: 1000})
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	err = svc.Settle(ctx, relay.Result{
+	err = svc.Settle(ctx, billing.Result{
 		RequestID:     rand.Text(),
 		Model:         "mock-model",
 		Usage:         openai.Usage{PromptTokens: 1000, CompletionTokens: 1000},
@@ -127,7 +154,7 @@ func TestSettleChargesMoreThanReservedWhenPromptWasUnderestimated(t *testing.T) 
 // 结算是同步做的，它的耗时直接加在每个请求的延迟上，所以单独量一下。
 func BenchmarkReserveAndSettle(b *testing.B) {
 	db := testdb.New(b)
-	svc := billing.New(slog.New(slog.DiscardHandler), db, prices)
+	svc := billing.New(db, prices)
 	_, hash := apikey.Generate()
 	key, err := apikey.NewStore(db).Create(b.Context(), "benchmark", hash)
 	require.NoError(b, err)
@@ -143,7 +170,7 @@ func BenchmarkReserveAndSettle(b *testing.B) {
 	})
 	b.Run("settle", func(b *testing.B) {
 		for b.Loop() {
-			err := svc.Settle(ctx, relay.Result{
+			err := svc.Settle(ctx, billing.Result{
 				RequestID:     rand.Text(),
 				Model:         "mock-model",
 				Usage:         openai.Usage{PromptTokens: 1, CompletionTokens: 5},
@@ -159,7 +186,7 @@ func BenchmarkReserveAndSettle(b *testing.B) {
 func newService(t *testing.T) (*billing.Service, *gorm.DB) {
 	t.Helper()
 	db := testdb.New(t)
-	return billing.New(slog.New(slog.DiscardHandler), db, prices), db
+	return billing.New(db, prices), db
 }
 
 // keyWithBalance 建一个有余额的 Key，返回带着这个 Key 的 context，计费从 context 里认出扣谁的钱。
