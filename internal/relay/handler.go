@@ -77,9 +77,10 @@ func New(cfg *config.Config, biller Biller, logger *slog.Logger) *Handler {
 	for _, m := range cfg.Models {
 		u := upstreams[m.Upstream]
 		h.routes[m.Name] = route{
-			upstream: u.Name,
-			url:      strings.TrimSuffix(u.BaseURL, "/") + "/chat/completions",
-			key:      u.Key,
+			upstream:         u.Name,
+			url:              strings.TrimSuffix(u.BaseURL, "/") + "/chat/completions",
+			key:              u.Key,
+			defaultMaxTokens: m.DefaultMaxTokens,
 		}
 		h.models.Data = append(h.models.Data, openai.Model{ID: m.Name, Object: "model", OwnedBy: u.Name})
 	}
@@ -103,24 +104,50 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusNotFound, openai.NewError(openai.TypeInvalidRequest, "model_not_found", fmt.Sprintf("model %q does not exist", req.Model)))
 		return
 	}
-	if req.Stream {
-		// 上游默认不在流里报告用量，这里强制要一份；调用方自己没要的话，转发时再剥掉
-		if body, err = forceIncludeUsage(body); err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(openai.TypeInvalidRequest, "invalid_request", err.Error()))
-			return
-		}
+	maxOutput := req.OutputLimit()
+	if maxOutput == 0 {
+		maxOutput = rt.defaultMaxTokens
 	}
-
-	m := newMeter(req.Messages)
-	upstreamFailed := h.forward(c, rt, body, req, m)
+	if body, err = prepareBody(body, req, maxOutput); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(openai.TypeInvalidRequest, "invalid_request", err.Error()))
+		return
+	}
 
 	ctx := c.Request.Context()
-	usage, estimated := m.usage(upstreamFailed)
-	result := Result{RequestID: requestid.From(ctx), Model: req.Model, Usage: usage, Estimated: estimated}
-	// 调用方可能已经断开，结算不能随请求一起取消
-	if err := h.biller.Settle(context.WithoutCancel(ctx), result); err != nil {
-		h.logger.ErrorContext(ctx, "settle failed", "error", err)
+	m := newMeter(req.Messages)
+	reserved, ok, err := h.biller.Reserve(ctx, Reservation{
+		Model:           req.Model,
+		PromptTokens:    m.promptTokens(),
+		MaxOutputTokens: maxOutput,
+	})
+	switch {
+	case err != nil:
+		h.logger.ErrorContext(ctx, "reserve failed", "error", err)
+		c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(openai.TypeServer, "internal_error", "internal server error"))
+		return
+	case !ok:
+		c.AbortWithStatusJSON(http.StatusTooManyRequests,
+			openai.NewError(openai.TypeInvalidRequest, "insufficient_quota", "insufficient balance for this request"))
+		return
 	}
+
+	upstreamFailed := false
+	// 预扣已经发生，结算必须跟上，所以放进 defer：转发过程中即使 panic，预扣也会被退回
+	defer func() {
+		usage, estimated := m.usage(upstreamFailed)
+		result := Result{
+			RequestID:     requestid.From(ctx),
+			Model:         req.Model,
+			Usage:         usage,
+			Estimated:     estimated,
+			ReservedMicro: reserved,
+		}
+		// 调用方可能已经断开，结算不能随请求一起取消
+		if err := h.biller.Settle(context.WithoutCancel(ctx), result); err != nil {
+			h.logger.ErrorContext(ctx, "settle failed", "error", err)
+		}
+	}()
+	upstreamFailed = h.forward(c, rt, body, req, m)
 }
 
 // readRequest 读出请求体，并解析网关要用的字段。

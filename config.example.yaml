@@ -20,8 +20,15 @@ upstreams:
   #   base_url: https://api.deepseek.com/v1
   #   key_env: DEEPSEEK_API_KEY
 
+# 单价的单位是元每百万 token；default_max_tokens 是调用方没指定输出上限时的默认值，预扣按它计算。
 models:
   - name: mock-model
     upstream: mock
+    input_price: 2
+    output_price: 8
+    default_max_tokens: 4096
   # - name: deepseek-chat
   #   upstream: deepseek
+  #   input_price: 2
+  #   output_price: 8
+  #   default_max_tokens: 4096

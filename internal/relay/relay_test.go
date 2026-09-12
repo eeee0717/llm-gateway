@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +27,9 @@ import (
 
 // 消息文本是 5 个 ASCII 字符：mock 上游报告 5 个 prompt token；网关按 0.3 token/字符估算，向上取整为 2。
 const helloMessages = `"messages":[{"role":"user","content":"hello"}]`
+
+// defaultMaxTokens 是测试配置里每个模型的默认输出上限。
+const defaultMaxTokens = 4096
 
 func TestNonStreamReturnsAnswerAndReportedUsage(t *testing.T) {
 	gw := startGateway(t, map[string]http.Handler{
@@ -259,6 +263,55 @@ func TestUpstreamStreamEndingBeforeAnyContentChargesNothing(t *testing.T) {
 	require.Equal(t, openai.Usage{}, gw.biller.next(t).Usage)
 }
 
+// 余额不够时请求根本不转发，也就不会产生费用。
+func TestRejectsRequestWhenReserveFails(t *testing.T) {
+	mock := mockupstream.New(mockupstream.Options{Tokens: 3})
+	gw := startGateway(t, map[string]http.Handler{"mock-model": mock})
+	gw.biller.reserveOK.Store(false)
+
+	resp := gw.post(t, t.Context(), `{"model":"mock-model",`+helloMessages+`}`)
+
+	require.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+	require.Equal(t, "insufficient_quota", errorIn(t, resp).Code)
+	require.Zero(t, mock.Requests())
+	require.Empty(t, gw.biller.results) // 没预扣成功就没有要结算的
+}
+
+// 调用方没指定输出上限时，按模型的默认值预扣，并把它写进发给上游的请求，免得上游生成得比预扣的假设还多。
+func TestFillsInTheModelDefaultOutputLimit(t *testing.T) {
+	upstream := &recordingUpstream{bodies: make(chan []byte, 1)}
+	gw := startGateway(t, map[string]http.Handler{"mock-model": upstream})
+
+	gw.post(t, t.Context(), `{"model":"mock-model",`+helloMessages+`}`)
+
+	require.Equal(t, defaultMaxTokens, maxTokensIn(t, <-upstream.bodies))
+	reservation := gw.biller.nextReservation(t)
+	require.Equal(t, "mock-model", reservation.Model)
+	require.Equal(t, defaultMaxTokens, reservation.MaxOutputTokens)
+	require.Equal(t, 2, reservation.PromptTokens) // "hello" 估算出 2 个 token
+}
+
+// 调用方自己指定了输出上限就按它预扣，请求体不改。
+func TestUsesTheCallerOutputLimitForReserve(t *testing.T) {
+	upstream := &recordingUpstream{bodies: make(chan []byte, 1)}
+	gw := startGateway(t, map[string]http.Handler{"mock-model": upstream})
+
+	gw.post(t, t.Context(), `{"model":"mock-model","max_tokens":50,`+helloMessages+`}`)
+
+	require.Equal(t, 50, maxTokensIn(t, <-upstream.bodies))
+	require.Equal(t, 50, gw.biller.nextReservation(t).MaxOutputTokens)
+}
+
+// 预扣的金额要原样带到结算，结算才知道该退多少。
+func TestSettleCarriesTheReservedAmount(t *testing.T) {
+	gw := startGateway(t, map[string]http.Handler{"mock-model": mockupstream.New(mockupstream.Options{Tokens: 3})})
+	gw.biller.reserved.Store(777)
+
+	gw.post(t, t.Context(), `{"model":"mock-model",`+helloMessages+`}`)
+
+	require.EqualValues(t, 777, gw.biller.next(t).ReservedMicro)
+}
+
 func TestRoutesEachModelToItsUpstreamWithUpstreamKey(t *testing.T) {
 	a := mockupstream.New(mockupstream.Options{Tokens: 1})
 	b := mockupstream.New(mockupstream.Options{Tokens: 1})
@@ -319,6 +372,28 @@ func TestModelsListsConfiguredModels(t *testing.T) {
 		{ID: "model-a", Object: "model", OwnedBy: "upstream-model-a"},
 		{ID: "model-b", Object: "model", OwnedBy: "upstream-model-b"},
 	}, list.Data)
+}
+
+// recordingUpstream 记下收到的请求体，并回一个最小的非流式响应。
+type recordingUpstream struct {
+	bodies chan []byte
+}
+
+func (u *recordingUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	u.bodies <- body
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+}
+
+// maxTokensIn 取出发给上游的请求里的输出上限。
+func maxTokensIn(t *testing.T, body []byte) int {
+	t.Helper()
+	var sent struct {
+		MaxTokens int `json:"max_tokens"`
+	}
+	require.NoError(t, json.Unmarshal(body, &sent))
+	return sent.MaxTokens
 }
 
 // errorIn 解析调用方收到的错误响应。
@@ -383,14 +458,17 @@ func usageEventsIn(t *testing.T, events []string) int {
 	return n
 }
 
-// recordingBiller 记下每次结算收到的结果。
+// recordingBiller 记下每次预扣和结算收到的内容。reserveOK 置为 false 就是余额不够。
 type recordingBiller struct {
-	results chan relay.Result
+	reservations chan relay.Reservation
+	results      chan relay.Result
+	reserveOK    atomic.Bool
+	reserved     atomic.Int64
 }
 
-// Reserve 放行所有请求；余额不够的情况由 internal/billing 的测试覆盖。
-func (b *recordingBiller) Reserve(context.Context, relay.Reservation) (int64, bool, error) {
-	return 0, true, nil
+func (b *recordingBiller) Reserve(_ context.Context, r relay.Reservation) (int64, bool, error) {
+	b.reservations <- r
+	return b.reserved.Load(), b.reserveOK.Load(), nil
 }
 
 func (b *recordingBiller) Settle(_ context.Context, r relay.Result) error {
@@ -410,6 +488,18 @@ func (b *recordingBiller) next(t *testing.T) relay.Result {
 	}
 }
 
+// nextReservation 取出这次请求的预扣信息。
+func (b *recordingBiller) nextReservation(t *testing.T) relay.Reservation {
+	t.Helper()
+	select {
+	case r := <-b.reservations:
+		return r
+	case <-time.After(5 * time.Second):
+		t.Fatal("5 秒内没有发生预扣")
+		return relay.Reservation{}
+	}
+}
+
 type gateway struct {
 	url    string
 	biller *recordingBiller
@@ -424,10 +514,14 @@ func startGateway(t *testing.T, models map[string]http.Handler) *gateway {
 		t.Cleanup(upstream.Close)
 		name := "upstream-" + model
 		cfg.Upstreams = append(cfg.Upstreams, config.Upstream{Name: name, BaseURL: upstream.URL + "/v1", Key: "key-" + model})
-		cfg.Models = append(cfg.Models, config.Model{Name: model, Upstream: name})
+		cfg.Models = append(cfg.Models, config.Model{Name: model, Upstream: name, DefaultMaxTokens: defaultMaxTokens})
 	}
 	logger := slog.New(slog.DiscardHandler)
-	biller := &recordingBiller{results: make(chan relay.Result, 10)}
+	biller := &recordingBiller{
+		reservations: make(chan relay.Reservation, 10),
+		results:      make(chan relay.Result, 10),
+	}
+	biller.reserveOK.Store(true)
 	srv := httptest.NewServer(server.New(logger, relay.New(cfg, biller, logger), stubAuth))
 	t.Cleanup(srv.Close)
 	return &gateway{url: srv.URL, biller: biller}

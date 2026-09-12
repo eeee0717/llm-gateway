@@ -5,14 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
+
+	"github.com/eeee0717/llm-gateway/internal/openai"
 )
 
 // route 是一个模型的转发目标。
 type route struct {
-	upstream string // 上游名称，只用于日志
-	url      string // 上游的 chat/completions 地址
-	key      string // 上游密钥
+	upstream         string // 上游名称，只用于日志
+	url              string // 上游的 chat/completions 地址
+	key              string // 上游密钥
+	defaultMaxTokens int    // 调用方没指定输出上限时用的默认值
 }
 
 // newClient 返回访问上游用的 HTTP 客户端。
@@ -37,15 +41,34 @@ func (h *Handler) send(ctx context.Context, rt route, body []byte) (*http.Respon
 	return h.client.Do(req)
 }
 
-// forceIncludeUsage 在请求体里打开 stream_options.include_usage，让上游在流的末尾报告用量。
+// prepareBody 改写发往上游的请求体，改两处：流式请求强制要用量；调用方没指定输出上限时补上模型的默认值，
+// 让上游生成的内容不会超过预扣时的假设。两处都不用改时原样返回。
 // 请求体按 map 解析后再写回：其余字段的语义不变，但字段顺序、空白和转义方式可能和原文不同。
-func forceIncludeUsage(body []byte) ([]byte, error) {
+func prepareBody(body []byte, req openai.ChatRequest, maxOutputTokens int) ([]byte, error) {
+	if !req.Stream && req.OutputLimit() != 0 {
+		return body, nil
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil {
 		return nil, err
 	}
+	if req.Stream {
+		opts, err := includeUsage(fields["stream_options"])
+		if err != nil {
+			return nil, err
+		}
+		fields["stream_options"] = opts
+	}
+	if req.OutputLimit() == 0 {
+		fields["max_tokens"] = json.RawMessage(strconv.Itoa(maxOutputTokens))
+	}
+	return json.Marshal(fields)
+}
+
+// includeUsage 在 stream_options 里打开 include_usage，让上游在流的末尾报告用量。
+func includeUsage(raw json.RawMessage) (json.RawMessage, error) {
 	var opts map[string]json.RawMessage
-	if raw, ok := fields["stream_options"]; ok {
+	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &opts); err != nil {
 			return nil, err
 		}
@@ -54,10 +77,5 @@ func forceIncludeUsage(body []byte) ([]byte, error) {
 		opts = make(map[string]json.RawMessage)
 	}
 	opts["include_usage"] = json.RawMessage("true")
-	raw, err := json.Marshal(opts)
-	if err != nil {
-		return nil, err
-	}
-	fields["stream_options"] = raw
-	return json.Marshal(fields)
+	return json.Marshal(opts)
 }

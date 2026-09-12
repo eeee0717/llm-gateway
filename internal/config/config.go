@@ -41,10 +41,14 @@ type Upstream struct {
 	Key     string `yaml:"-"`        // 上游密钥，加载时从 KeyEnv 读出，不写在文件里
 }
 
-// Model 是一个模型：名称与上游的模型名一致，固定走一个上游。
+// Model 是一个模型：名称与上游的模型名一致，固定走一个上游，并带着自己的单价和默认输出上限。
 type Model struct {
-	Name     string `yaml:"name"`
-	Upstream string `yaml:"upstream"` // 上游的 Name
+	Name        string  `yaml:"name"`
+	Upstream    string  `yaml:"upstream"`     // 上游的 Name
+	InputPrice  float64 `yaml:"input_price"`  // 输入单价，元每百万 prompt token
+	OutputPrice float64 `yaml:"output_price"` // 输出单价，元每百万 completion token
+	// DefaultMaxTokens 是调用方没指定输出上限时用的默认值。预扣按输出上限算，所以它必须有值。
+	DefaultMaxTokens int `yaml:"default_max_tokens"`
 }
 
 // Load 读取并校验配置文件。
@@ -112,6 +116,10 @@ func (c *Config) resolve() error {
 			return fmt.Errorf("duplicate model %q", m.Name)
 		case !upstreams[m.Upstream]:
 			return fmt.Errorf("model %q: unknown upstream %q", m.Name, m.Upstream)
+		case m.InputPrice < 0 || m.OutputPrice < 0:
+			return fmt.Errorf("model %q: prices must not be negative", m.Name)
+		case m.DefaultMaxTokens <= 0:
+			return fmt.Errorf("model %q: default_max_tokens must be positive", m.Name)
 		}
 		models[m.Name] = true
 	}

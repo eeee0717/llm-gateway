@@ -25,6 +25,9 @@ upstreams:
 models:
   - name: deepseek-chat
     upstream: deepseek
+    input_price: 2
+    output_price: 3
+    default_max_tokens: 4096
 `
 
 func TestLoadReadsSecretsFromEnv(t *testing.T) {
@@ -43,7 +46,13 @@ func TestLoadReadsSecretsFromEnv(t *testing.T) {
 			KeyEnv:  "TEST_DEEPSEEK_KEY",
 			Key:     "sk-upstream",
 		}},
-		Models: []config.Model{{Name: "deepseek-chat", Upstream: "deepseek"}},
+		Models: []config.Model{{
+			Name:             "deepseek-chat",
+			Upstream:         "deepseek",
+			InputPrice:       2,
+			OutputPrice:      3,
+			DefaultMaxTokens: 4096,
+		}},
 	}, cfg)
 }
 
@@ -74,6 +83,7 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"base url without scheme", strings.Replace(validConfig, "https://", "", 1), "base_url"},
 		{"unknown upstream", strings.Replace(validConfig, "upstream: deepseek", "upstream: openai", 1), `"openai"`},
 		{"duplicate model", validConfig + "  - name: deepseek-chat\n    upstream: deepseek\n", `"deepseek-chat"`},
+		{"model without output limit", strings.Replace(validConfig, "    default_max_tokens: 4096\n", "", 1), "default_max_tokens"},
 		{"no models", strings.Split(validConfig, "models:")[0], "model"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

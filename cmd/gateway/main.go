@@ -20,6 +20,7 @@ import (
 
 	"github.com/eeee0717/llm-gateway/internal/admin"
 	"github.com/eeee0717/llm-gateway/internal/apikey"
+	"github.com/eeee0717/llm-gateway/internal/billing"
 	"github.com/eeee0717/llm-gateway/internal/config"
 	"github.com/eeee0717/llm-gateway/internal/relay"
 	"github.com/eeee0717/llm-gateway/internal/requestid"
@@ -100,7 +101,7 @@ func serve(args []string) error {
 	}
 
 	keys := apikey.NewStore(db)
-	rh := relay.New(cfg, logBiller{logger}, logger)
+	rh := relay.New(cfg, billing.New(logger, db, prices(cfg)), logger)
 	ah := admin.New(logger, keys)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -110,22 +111,11 @@ func serve(args []string) error {
 	)
 }
 
-// logBiller 在接入计费之前顶替结算：只把每次请求的用量写进日志。
-type logBiller struct {
-	logger *slog.Logger
-}
-
-// Reserve 在接入计费之前不拦任何请求。
-func (b logBiller) Reserve(context.Context, relay.Reservation) (int64, bool, error) {
-	return 0, true, nil
-}
-
-func (b logBiller) Settle(ctx context.Context, r relay.Result) error {
-	b.logger.InfoContext(ctx, "usage",
-		"model", r.Model,
-		"prompt_tokens", r.Usage.PromptTokens,
-		"completion_tokens", r.Usage.CompletionTokens,
-		"estimated", r.Estimated,
-	)
-	return nil
+// prices 把配置里每个模型的单价整理成计费用的表。
+func prices(cfg *config.Config) map[string]billing.Price {
+	p := make(map[string]billing.Price, len(cfg.Models))
+	for _, m := range cfg.Models {
+		p[m.Name] = billing.Price{Input: m.InputPrice, Output: m.OutputPrice}
+	}
+	return p
 }

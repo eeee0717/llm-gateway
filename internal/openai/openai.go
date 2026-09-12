@@ -37,12 +37,21 @@ type ChatRequest struct {
 	Model         string         `json:"model"`
 	Stream        bool           `json:"stream"`
 	StreamOptions *StreamOptions `json:"stream_options"`
+	MaxTokens     *int           `json:"max_tokens"` // 输出上限；调用方没指定时为 nil，网关补上模型的默认值
 	Messages      []Message      `json:"messages"`
 }
 
 // StreamOptions 是流式请求的选项。IncludeUsage 为 true 时，上游在流的末尾多发一个只含 usage 的事件。
 type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
+}
+
+// OutputLimit 返回请求指定的输出上限。没指定或者填了个不合法的值时返回 0，由网关补上模型的默认值。
+func (r ChatRequest) OutputLimit() int {
+	if r.MaxTokens == nil || *r.MaxTokens <= 0 {
+		return 0
+	}
+	return *r.MaxTokens
 }
 
 // IncludeUsage 表示请求是否要求在流里报告用量。

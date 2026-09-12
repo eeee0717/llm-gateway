@@ -22,6 +22,11 @@ func newMeter(messages []openai.Message) *meter {
 	return m
 }
 
+// promptTokens 返回估算出来的 prompt token 数，预扣时用。
+func (m *meter) promptTokens() int {
+	return m.prompt.tokens()
+}
+
 // observe 记下一段转发给调用方的响应：非流式的完整响应，或者流式的一个事件。
 func (m *meter) observe(r openai.ChatResponse) {
 	if r.Usage != nil {
