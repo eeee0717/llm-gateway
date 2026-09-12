@@ -27,16 +27,27 @@ const (
 	maxErrorBytes = 64 << 10
 )
 
+// Reservation 是预扣所需的信息：一次请求最多可能花多少钱，由它算出来。
+type Reservation struct {
+	Model           string
+	PromptTokens    int // 估算的 prompt token
+	MaxOutputTokens int // 这次请求的输出上限
+}
+
 // Result 是一次转发的结果，交给 Biller 结算。
 type Result struct {
-	RequestID string
-	Model     string
-	Usage     openai.Usage
-	Estimated bool // 用量是网关估算的，而不是上游报告的
+	RequestID     string
+	Model         string
+	Usage         openai.Usage
+	Estimated     bool  // 用量是网关估算的，而不是上游报告的
+	ReservedMicro int64 // 这次请求预扣的金额，结算时多退少补
 }
 
 // Biller 是 relay 对计费的全部要求。接口由 relay 定义，实现由 cmd/gateway 注入。
 type Biller interface {
+	// Reserve 在转发之前预扣最大可能的费用，返回预扣的金额。
+	// ok 为 false 表示余额不够或者 Key 被禁用，这次请求不该转发；err 只表示系统故障，例如数据库连不上。
+	Reserve(ctx context.Context, r Reservation) (reserved int64, ok bool, err error)
 	// Settle 结算一次请求。调用方可能已经断开，传进来的 ctx 不会随请求取消。
 	Settle(ctx context.Context, r Result) error
 }

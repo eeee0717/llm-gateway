@@ -115,6 +115,11 @@ type logBiller struct {
 	logger *slog.Logger
 }
 
+// Reserve 在接入计费之前不拦任何请求。
+func (b logBiller) Reserve(context.Context, relay.Reservation) (int64, bool, error) {
+	return 0, true, nil
+}
+
 func (b logBiller) Settle(ctx context.Context, r relay.Result) error {
 	b.logger.InfoContext(ctx, "usage",
 		"model", r.Model,

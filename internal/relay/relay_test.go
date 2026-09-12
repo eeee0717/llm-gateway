@@ -388,6 +388,11 @@ type recordingBiller struct {
 	results chan relay.Result
 }
 
+// Reserve 放行所有请求；余额不够的情况由 internal/billing 的测试覆盖。
+func (b *recordingBiller) Reserve(context.Context, relay.Reservation) (int64, bool, error) {
+	return 0, true, nil
+}
+
 func (b *recordingBiller) Settle(_ context.Context, r relay.Result) error {
 	b.results <- r
 	return nil
