@@ -14,8 +14,15 @@ import (
 // Config 是网关的全部配置。
 type Config struct {
 	Listen    string     `yaml:"listen"` // 业务端口的监听地址，默认 :8080
+	Database  Database   `yaml:"database"`
 	Upstreams []Upstream `yaml:"upstreams"`
 	Models    []Model    `yaml:"models"`
+}
+
+// Database 是 PostgreSQL 的连接配置。连接串里带口令，所以和上游密钥一样只写环境变量名。
+type Database struct {
+	DSNEnv string `yaml:"dsn_env"` // 存放连接串的环境变量名
+	DSN    string `yaml:"-"`       // 连接串，加载时从 DSNEnv 读出
 }
 
 // Upstream 是一个上游。
@@ -57,6 +64,13 @@ func Load(path string) (*Config, error) {
 
 // resolve 校验各项配置以及它们之间的引用，并从环境变量读出上游密钥。
 func (c *Config) resolve() error {
+	if c.Database.DSNEnv == "" {
+		return errors.New("database: dsn_env is required")
+	}
+	if c.Database.DSN = os.Getenv(c.Database.DSNEnv); c.Database.DSN == "" {
+		return fmt.Errorf("database: environment variable %s is not set", c.Database.DSNEnv)
+	}
+
 	upstreams := make(map[string]bool, len(c.Upstreams))
 	for i := range c.Upstreams {
 		u := &c.Upstreams[i]

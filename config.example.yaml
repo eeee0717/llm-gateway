@@ -1,5 +1,10 @@
-# 网关配置示例。上游密钥不写在这里，只写存放它的环境变量名。
+# 网关配置示例。密钥和数据库连接串都不写在这里，只写存放它们的环境变量名。
 listen: ":8080"
+
+# 本地依赖由 docker compose up -d 提供，对应的连接串是：
+#   export DATABASE_DSN='postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable'
+database:
+  dsn_env: DATABASE_DSN
 
 upstreams:
   # 本地 mock 上游：go run ./cmd/mockupstream

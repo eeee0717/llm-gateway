@@ -13,6 +13,8 @@ import (
 
 const validConfig = `
 listen: ":9000"
+database:
+  dsn_env: TEST_DATABASE_DSN
 upstreams:
   - name: deepseek
     base_url: https://api.deepseek.com/v1
@@ -22,14 +24,15 @@ models:
     upstream: deepseek
 `
 
-func TestLoadReadsUpstreamKeyFromEnv(t *testing.T) {
-	t.Setenv("TEST_DEEPSEEK_KEY", "sk-upstream")
+func TestLoadReadsSecretsFromEnv(t *testing.T) {
+	setenv(t)
 
 	cfg, err := config.Load(writeConfig(t, validConfig))
 
 	require.NoError(t, err)
 	require.Equal(t, &config.Config{
-		Listen: ":9000",
+		Listen:   ":9000",
+		Database: config.Database{DSNEnv: "TEST_DATABASE_DSN", DSN: "postgres://localhost/test"},
 		Upstreams: []config.Upstream{{
 			Name:    "deepseek",
 			BaseURL: "https://api.deepseek.com/v1",
@@ -41,7 +44,7 @@ func TestLoadReadsUpstreamKeyFromEnv(t *testing.T) {
 }
 
 func TestLoadDefaultsListenAddress(t *testing.T) {
-	t.Setenv("TEST_DEEPSEEK_KEY", "sk-upstream")
+	setenv(t)
 
 	cfg, err := config.Load(writeConfig(t, strings.Replace(validConfig, `listen: ":9000"`, "", 1)))
 
@@ -50,7 +53,7 @@ func TestLoadDefaultsListenAddress(t *testing.T) {
 }
 
 func TestLoadRejectsInvalidConfig(t *testing.T) {
-	t.Setenv("TEST_DEEPSEEK_KEY", "sk-upstream")
+	setenv(t)
 
 	for _, tc := range []struct {
 		name    string
@@ -59,6 +62,8 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 	}{
 		{"unknown field", validConfig + "timeout: 3s\n", "timeout"},
 		{"key env not set", strings.Replace(validConfig, "TEST_DEEPSEEK_KEY", "TEST_UNSET_KEY", 1), "TEST_UNSET_KEY"},
+		{"dsn env not set", strings.Replace(validConfig, "TEST_DATABASE_DSN", "TEST_UNSET_DSN", 1), "TEST_UNSET_DSN"},
+		{"no database", strings.Replace(validConfig, "  dsn_env: TEST_DATABASE_DSN\n", "", 1), "dsn_env"},
 		{"base url without scheme", strings.Replace(validConfig, "https://", "", 1), "base_url"},
 		{"unknown upstream", strings.Replace(validConfig, "upstream: deepseek", "upstream: openai", 1), `"openai"`},
 		{"duplicate model", validConfig + "  - name: deepseek-chat\n    upstream: deepseek\n", `"deepseek-chat"`},
@@ -69,6 +74,13 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 			require.ErrorContains(t, err, tc.wantErr)
 		})
 	}
+}
+
+// setenv 设置示例配置引用的两个环境变量。
+func setenv(t *testing.T) {
+	t.Helper()
+	t.Setenv("TEST_DEEPSEEK_KEY", "sk-upstream")
+	t.Setenv("TEST_DATABASE_DSN", "postgres://localhost/test")
 }
 
 func writeConfig(t *testing.T, content string) string {

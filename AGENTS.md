@@ -58,7 +58,9 @@ internal/
   sse/            按事件读取 SSE，保留原始字节以便原样转发
   openai/         用到的 OpenAI 协议子集与错误响应
   mockupstream/   mock 上游实现，测试与 cmd/mockupstream 共用
-migrations/       goose SQL 迁移
+  testdb/         测试用的数据库连接：连 compose 起的 PG，首次使用时执行迁移
+migrations/       goose SQL 迁移，embed 进二进制
+compose.yaml      本地依赖：PostgreSQL 与 Redis
 docs/adr/         难以逆转的决策，文件名 NNNN-英文短名.md
 docs/notes/       每个功能一页说明
 ```
@@ -95,4 +97,4 @@ docs/notes/       每个功能一页说明
 1. `gofmt -l .` 无输出；`go vet ./...`、`golangci-lint run`、`go test -race ./...` 全部通过。
 2. 收口断言有测试覆盖，`docs/notes/` 里有对应的说明。
 3. 汇报非测试代码行数和 3000 行预算的余量，统一用这条命令计数（不含空行和整行注释）：
-   `find cmd internal -name '*.go' ! -name '*_test.go' -exec cat {} + | grep -cvE '^[[:space:]]*(//.*)?$'`
+   `find cmd internal migrations -name '*.go' ! -name '*_test.go' -exec cat {} + | grep -cvE '^[[:space:]]*(//.*)?$'`
