@@ -36,12 +36,16 @@ func New(t testing.TB) *gorm.DB {
 	return sharedDB
 }
 
-func open() {
-	dsn := os.Getenv(dsnEnv)
-	if dsn == "" {
-		dsn = defaultDSN
+// DSN 返回测试数据库的连接串，自己开连接池的测试用得上。
+func DSN() string {
+	if dsn := os.Getenv(dsnEnv); dsn != "" {
+		return dsn
 	}
-	sharedDB, openErr = gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Discard})
+	return defaultDSN
+}
+
+func open() {
+	sharedDB, openErr = gorm.Open(postgres.Open(DSN()), &gorm.Config{Logger: logger.Discard})
 	if openErr != nil {
 		return
 	}

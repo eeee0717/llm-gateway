@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -85,7 +86,19 @@ func migrate(args []string) error {
 
 // openDB 连接 PostgreSQL。GORM 自带的日志会直接打到标准输出、和 JSON 日志混在一起，所以关掉。
 func openDB(dsn string) (*gorm.DB, error) {
-	return gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: gormlogger.Discard})
+	gdb, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: gormlogger.Discard})
+	if err != nil {
+		return nil, err
+	}
+	db, err := gdb.DB()
+	if err != nil {
+		return nil, err
+	}
+	// 一个实例最多占 20 条连接。PostgreSQL 默认只允许 100 条，多起几个实例也不会把连接占满；
+	// 并发再高也只是在这 20 条上排队，预扣本来就是同一行上的串行操作。
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(10)
+	return gdb, nil
 }
 
 // serve 加载配置、组装依赖并启动网关，收到 SIGINT 或 SIGTERM 后优雅退出。
@@ -100,15 +113,22 @@ func serve(args []string) error {
 		return err
 	}
 
-	keys := apikey.NewStore(db)
-	rh := relay.New(cfg, billing.New(logger, db, prices(cfg)), logger)
-	ah := admin.New(logger, keys)
+	business, management := build(cfg, db, logger)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return server.Run(ctx, logger,
-		server.Listener{Name: "business", Addr: cfg.Listen, Handler: server.New(logger, rh, apikey.Middleware(logger, keys))},
-		server.Listener{Name: "admin", Addr: cfg.Admin.Listen, Handler: server.NewAdmin(logger, ah, admin.Auth(cfg.Admin.Key))},
+		server.Listener{Name: "business", Addr: cfg.Listen, Handler: business},
+		server.Listener{Name: "admin", Addr: cfg.Admin.Listen, Handler: management},
 	)
+}
+
+// build 组装两个端口的处理器。所有依赖都在这里接起来，测试也用它，测的就是真正跑起来的那套装配。
+func build(cfg *config.Config, db *gorm.DB, logger *slog.Logger) (business, management http.Handler) {
+	keys := apikey.NewStore(db)
+	rh := relay.New(cfg, billing.New(logger, db, prices(cfg)), logger)
+	ah := admin.New(logger, keys)
+	return server.New(logger, rh, apikey.Middleware(logger, keys)),
+		server.NewAdmin(logger, ah, admin.Auth(cfg.Admin.Key))
 }
 
 // prices 把配置里每个模型的单价整理成计费用的表。
