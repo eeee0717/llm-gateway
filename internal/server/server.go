@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/eeee0717/llm-gateway/internal/admin"
 	"github.com/eeee0717/llm-gateway/internal/openai"
 	"github.com/eeee0717/llm-gateway/internal/relay"
 	"github.com/eeee0717/llm-gateway/internal/requestid"
@@ -18,40 +19,69 @@ import (
 // shutdownTimeout 是优雅退出时等待进行中请求的最长时间。
 const shutdownTimeout = 30 * time.Second
 
-// New 返回业务端口的 HTTP 处理器。
+// New 返回业务端口的处理器。
 func New(logger *slog.Logger, rh *relay.Handler) http.Handler {
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
-	// requestid 放在最前面：访问日志和后面的 handler 都要从 context 里取请求 ID
-	r.Use(requestid.Middleware(), accessLog(logger), recovery(logger))
+	r := engine(logger)
 	r.POST("/v1/chat/completions", rh.ChatCompletions)
 	r.GET("/v1/models", rh.Models)
 	return r
 }
 
-// Run 在 addr 上提供服务，直到 ctx 被取消；之后不再接受新请求，并等进行中的请求处理完（包括结算）。
-func Run(ctx context.Context, logger *slog.Logger, addr string, handler http.Handler) error {
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-		// 不设 WriteTimeout：它从读完请求头开始计时，会截断长时间的流式响应。
-		// IdleTimeout 不设时沿用 ReadTimeout，而 ReadTimeout 也没设，空闲的 keep-alive 连接就永远不会关闭。
-		IdleTimeout: 2 * time.Minute,
-	}
-	errc := make(chan error, 1)
-	go func() { errc <- srv.ListenAndServe() }()
-	logger.Info("listening", "addr", addr)
+// NewAdmin 返回管理端口的处理器。auth 校验管理员密钥，排在公共中间件之后。
+func NewAdmin(logger *slog.Logger, ah *admin.Handler, auth gin.HandlerFunc) http.Handler {
+	r := engine(logger, auth)
+	r.POST("/admin/keys", ah.CreateKey)
+	return r
+}
 
+// engine 建一个带公共中间件的 Gin 引擎：请求 ID 放最前，访问日志和后面的处理才取得到它。
+func engine(logger *slog.Logger, mw ...gin.HandlerFunc) *gin.Engine {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(append([]gin.HandlerFunc{requestid.Middleware(), accessLog(logger), recovery(logger)}, mw...)...)
+	return r
+}
+
+// Listener 是一个监听：业务端口或管理端口。
+type Listener struct {
+	Name    string // 只用于日志
+	Addr    string
+	Handler http.Handler
+}
+
+// Run 同时提供这些监听上的服务，直到 ctx 被取消，或者其中一个监听出错；
+// 之后不再接受新请求，并等进行中的请求处理完（包括结算）。
+func Run(ctx context.Context, logger *slog.Logger, listeners ...Listener) error {
+	servers := make([]*http.Server, 0, len(listeners))
+	errc := make(chan error, len(listeners))
+	for _, l := range listeners {
+		srv := &http.Server{
+			Addr:              l.Addr,
+			Handler:           l.Handler,
+			ReadHeaderTimeout: 10 * time.Second,
+			// 不设 WriteTimeout：它从读完请求头开始计时，会截断长时间的流式响应。
+			// IdleTimeout 不设时沿用 ReadTimeout，而 ReadTimeout 也没设，空闲的 keep-alive 连接就永远不会关闭。
+			IdleTimeout: 2 * time.Minute,
+		}
+		servers = append(servers, srv)
+		go func() { errc <- srv.ListenAndServe() }()
+		logger.Info("listening", "name", l.Name, "addr", l.Addr)
+	}
+
+	var err error
 	select {
-	case err := <-errc:
-		return err
+	case err = <-errc: // 有一个监听起不来（例如端口被占用），另一个也一起收摊
 	case <-ctx.Done():
 	}
 	logger.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	for _, srv := range servers {
+		if e := srv.Shutdown(shutdownCtx); e != nil && err == nil {
+			err = e
+		}
+	}
+	return err
 }
 
 // accessLog 在每个请求结束后记一条访问日志。它只读 c.Writer 的状态，不包装 ResponseWriter，流式刷新不受影响。

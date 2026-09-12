@@ -13,6 +13,9 @@ import (
 
 const validConfig = `
 listen: ":9000"
+admin:
+  listen: ":9001"
+  key_env: TEST_ADMIN_KEY
 database:
   dsn_env: TEST_DATABASE_DSN
 upstreams:
@@ -32,6 +35,7 @@ func TestLoadReadsSecretsFromEnv(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, &config.Config{
 		Listen:   ":9000",
+		Admin:    config.Admin{Listen: ":9001", KeyEnv: "TEST_ADMIN_KEY", Key: "admin-secret"},
 		Database: config.Database{DSNEnv: "TEST_DATABASE_DSN", DSN: "postgres://localhost/test"},
 		Upstreams: []config.Upstream{{
 			Name:    "deepseek",
@@ -43,13 +47,15 @@ func TestLoadReadsSecretsFromEnv(t *testing.T) {
 	}, cfg)
 }
 
-func TestLoadDefaultsListenAddress(t *testing.T) {
+func TestLoadDefaultsListenAddresses(t *testing.T) {
 	setenv(t)
+	noListen := strings.NewReplacer(`listen: ":9000"`, "", `  listen: ":9001"`, "").Replace(validConfig)
 
-	cfg, err := config.Load(writeConfig(t, strings.Replace(validConfig, `listen: ":9000"`, "", 1)))
+	cfg, err := config.Load(writeConfig(t, noListen))
 
 	require.NoError(t, err)
 	require.Equal(t, ":8080", cfg.Listen)
+	require.Equal(t, ":8081", cfg.Admin.Listen)
 }
 
 func TestLoadRejectsInvalidConfig(t *testing.T) {
@@ -64,6 +70,7 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"key env not set", strings.Replace(validConfig, "TEST_DEEPSEEK_KEY", "TEST_UNSET_KEY", 1), "TEST_UNSET_KEY"},
 		{"dsn env not set", strings.Replace(validConfig, "TEST_DATABASE_DSN", "TEST_UNSET_DSN", 1), "TEST_UNSET_DSN"},
 		{"no database", strings.Replace(validConfig, "  dsn_env: TEST_DATABASE_DSN\n", "", 1), "dsn_env"},
+		{"admin key env not set", strings.Replace(validConfig, "TEST_ADMIN_KEY", "TEST_UNSET_ADMIN_KEY", 1), "TEST_UNSET_ADMIN_KEY"},
 		{"base url without scheme", strings.Replace(validConfig, "https://", "", 1), "base_url"},
 		{"unknown upstream", strings.Replace(validConfig, "upstream: deepseek", "upstream: openai", 1), `"openai"`},
 		{"duplicate model", validConfig + "  - name: deepseek-chat\n    upstream: deepseek\n", `"deepseek-chat"`},
@@ -76,11 +83,12 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-// setenv 设置示例配置引用的两个环境变量。
+// setenv 设置示例配置引用的环境变量。
 func setenv(t *testing.T) {
 	t.Helper()
 	t.Setenv("TEST_DEEPSEEK_KEY", "sk-upstream")
 	t.Setenv("TEST_DATABASE_DSN", "postgres://localhost/test")
+	t.Setenv("TEST_ADMIN_KEY", "admin-secret")
 }
 
 func writeConfig(t *testing.T, content string) string {

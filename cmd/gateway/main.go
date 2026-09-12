@@ -6,7 +6,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,8 +14,12 @@ import (
 	"os/signal"
 	"syscall"
 
-	_ "github.com/jackc/pgx/v5/stdlib" // 注册 database/sql 的 pgx 驱动，迁移时用
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 
+	"github.com/eeee0717/llm-gateway/internal/admin"
+	"github.com/eeee0717/llm-gateway/internal/apikey"
 	"github.com/eeee0717/llm-gateway/internal/config"
 	"github.com/eeee0717/llm-gateway/internal/relay"
 	"github.com/eeee0717/llm-gateway/internal/requestid"
@@ -63,7 +66,11 @@ func migrate(args []string) error {
 	if err != nil {
 		return err
 	}
-	db, err := sql.Open("pgx", cfg.Database.DSN)
+	gdb, err := openDB(cfg.Database.DSN)
+	if err != nil {
+		return err
+	}
+	db, err := gdb.DB()
 	if err != nil {
 		return err
 	}
@@ -75,6 +82,11 @@ func migrate(args []string) error {
 	return nil
 }
 
+// openDB 连接 PostgreSQL。GORM 自带的日志会直接打到标准输出、和 JSON 日志混在一起，所以关掉。
+func openDB(dsn string) (*gorm.DB, error) {
+	return gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: gormlogger.Discard})
+}
+
 // serve 加载配置、组装依赖并启动网关，收到 SIGINT 或 SIGTERM 后优雅退出。
 func serve(args []string) error {
 	cfg, err := loadConfig("serve", args)
@@ -82,11 +94,19 @@ func serve(args []string) error {
 		return err
 	}
 	logger := slog.New(requestid.LogHandler(slog.NewJSONHandler(os.Stdout, nil)))
+	db, err := openDB(cfg.Database.DSN)
+	if err != nil {
+		return err
+	}
 
 	rh := relay.New(cfg, logBiller{logger}, logger)
+	ah := admin.New(logger, apikey.NewStore(db))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return server.Run(ctx, logger, cfg.Listen, server.New(logger, rh))
+	return server.Run(ctx, logger,
+		server.Listener{Name: "business", Addr: cfg.Listen, Handler: server.New(logger, rh)},
+		server.Listener{Name: "admin", Addr: cfg.Admin.Listen, Handler: server.NewAdmin(logger, ah, admin.Auth(cfg.Admin.Key))},
+	)
 }
 
 // logBiller 在接入计费之前顶替结算：只把每次请求的用量写进日志。

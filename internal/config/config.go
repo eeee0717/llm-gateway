@@ -14,9 +14,17 @@ import (
 // Config 是网关的全部配置。
 type Config struct {
 	Listen    string     `yaml:"listen"` // 业务端口的监听地址，默认 :8080
+	Admin     Admin      `yaml:"admin"`
 	Database  Database   `yaml:"database"`
 	Upstreams []Upstream `yaml:"upstreams"`
 	Models    []Model    `yaml:"models"`
+}
+
+// Admin 是管理端口的配置。管理接口和业务接口分开监听，方便只对内网开放。
+type Admin struct {
+	Listen string `yaml:"listen"`  // 管理端口的监听地址，默认 :8081
+	KeyEnv string `yaml:"key_env"` // 存放管理员密钥的环境变量名
+	Key    string `yaml:"-"`       // 管理员密钥，加载时从 KeyEnv 读出
 }
 
 // Database 是 PostgreSQL 的连接配置。连接串里带口令，所以和上游密钥一样只写环境变量名。
@@ -56,6 +64,9 @@ func Load(path string) (*Config, error) {
 	if cfg.Listen == "" {
 		cfg.Listen = ":8080"
 	}
+	if cfg.Admin.Listen == "" {
+		cfg.Admin.Listen = ":8081"
+	}
 	if err := cfg.resolve(); err != nil {
 		return nil, fmt.Errorf("invalid config %s: %w", path, err)
 	}
@@ -64,11 +75,12 @@ func Load(path string) (*Config, error) {
 
 // resolve 校验各项配置以及它们之间的引用，并从环境变量读出上游密钥。
 func (c *Config) resolve() error {
-	if c.Database.DSNEnv == "" {
-		return errors.New("database: dsn_env is required")
+	var err error
+	if c.Database.DSN, err = fromEnv("database", "dsn_env", c.Database.DSNEnv); err != nil {
+		return err
 	}
-	if c.Database.DSN = os.Getenv(c.Database.DSNEnv); c.Database.DSN == "" {
-		return fmt.Errorf("database: environment variable %s is not set", c.Database.DSNEnv)
+	if c.Admin.Key, err = fromEnv("admin", "key_env", c.Admin.KeyEnv); err != nil {
+		return err
 	}
 
 	upstreams := make(map[string]bool, len(c.Upstreams))
@@ -81,12 +93,10 @@ func (c *Config) resolve() error {
 			return fmt.Errorf("duplicate upstream %q", u.Name)
 		case !strings.HasPrefix(u.BaseURL, "http://") && !strings.HasPrefix(u.BaseURL, "https://"):
 			return fmt.Errorf("upstream %q: base_url must start with http:// or https://", u.Name)
-		case u.KeyEnv == "":
-			return fmt.Errorf("upstream %q: key_env is required", u.Name)
 		}
 		upstreams[u.Name] = true
-		if u.Key = os.Getenv(u.KeyEnv); u.Key == "" {
-			return fmt.Errorf("upstream %q: environment variable %s is not set", u.Name, u.KeyEnv)
+		if u.Key, err = fromEnv(fmt.Sprintf("upstream %q", u.Name), "key_env", u.KeyEnv); err != nil {
+			return err
 		}
 	}
 
@@ -106,4 +116,16 @@ func (c *Config) resolve() error {
 		models[m.Name] = true
 	}
 	return nil
+}
+
+// fromEnv 读出一个不写在配置文件里的值。what 和 field 只用来指出是哪一处配置出了问题。
+func fromEnv(what, field, envName string) (string, error) {
+	if envName == "" {
+		return "", fmt.Errorf("%s: %s is required", what, field)
+	}
+	value := os.Getenv(envName)
+	if value == "" {
+		return "", fmt.Errorf("%s: environment variable %s is not set", what, envName)
+	}
+	return value, nil
 }
