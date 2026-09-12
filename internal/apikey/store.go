@@ -40,12 +40,44 @@ func (s *Store) Create(ctx context.Context, name, hash string) (Key, error) {
 	return key, err
 }
 
-// ByHash 按 Key 的哈希查记录，查不到返回 ErrNotFound。鉴权走这条路径，命中的是 key_hash 上的唯一索引。
+// ByHash 按 Key 的哈希查记录。鉴权走这条路径，命中的是 key_hash 上的唯一索引。
 func (s *Store) ByHash(ctx context.Context, hash string) (Key, error) {
+	return s.find(ctx, "key_hash = ?", hash)
+}
+
+// ByID 按 ID 查记录，管理接口用。
+func (s *Store) ByID(ctx context.Context, id int64) (Key, error) {
+	return s.find(ctx, "id = ?", id)
+}
+
+// Credit 给余额加上 amountMicro，返回更新后的记录。充值是累加，不是设定值。
+func (s *Store) Credit(ctx context.Context, id, amountMicro int64) (Key, error) {
+	return s.update(ctx, `UPDATE api_keys SET balance_micro = balance_micro + ? WHERE id = ? RETURNING *`, amountMicro, id)
+}
+
+// Disable 停用一个 Key，余额保留。
+func (s *Store) Disable(ctx context.Context, id int64) (Key, error) {
+	return s.update(ctx, `UPDATE api_keys SET disabled = TRUE WHERE id = ? RETURNING *`, id)
+}
+
+func (s *Store) find(ctx context.Context, where string, arg any) (Key, error) {
 	var key Key
-	err := s.db.WithContext(ctx).Where("key_hash = ?", hash).Take(&key).Error
+	err := s.db.WithContext(ctx).Where(where, arg).Take(&key).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return Key{}, ErrNotFound
 	}
 	return key, err
+}
+
+// update 执行一条带 RETURNING 的更新，一条也没改到就是这个 Key 不存在。
+func (s *Store) update(ctx context.Context, sql string, args ...any) (Key, error) {
+	var key Key
+	res := s.db.WithContext(ctx).Raw(sql, args...).Scan(&key)
+	switch {
+	case res.Error != nil:
+		return Key{}, res.Error
+	case res.RowsAffected == 0:
+		return Key{}, ErrNotFound
+	}
+	return key, nil
 }

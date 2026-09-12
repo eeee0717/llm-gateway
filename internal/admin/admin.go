@@ -4,8 +4,10 @@ package admin
 
 import (
 	"crypto/subtle"
+	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,6 +58,55 @@ func (h *Handler) CreateKey(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusCreated, view(key, plain))
+}
+
+// GetKey 处理 GET /admin/keys/:id：查余额和状态。
+func (h *Handler) GetKey(c *gin.Context) {
+	h.respond(c, func(id int64) (apikey.Key, error) {
+		return h.keys.ByID(c.Request.Context(), id)
+	})
+}
+
+// Credit 处理 POST /admin/keys/:id/credit：给余额充值，金额的单位是微元。
+func (h *Handler) Credit(c *gin.Context) {
+	var body struct {
+		AmountMicro int64 `json:"amount_micro"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.AmountMicro <= 0 {
+		c.AbortWithStatusJSON(http.StatusBadRequest,
+			openai.NewError(openai.TypeInvalidRequest, "invalid_request", "amount_micro must be positive"))
+		return
+	}
+	h.respond(c, func(id int64) (apikey.Key, error) {
+		return h.keys.Credit(c.Request.Context(), id, body.AmountMicro)
+	})
+}
+
+// Disable 处理 POST /admin/keys/:id/disable：停用一个 Key，余额保留。
+func (h *Handler) Disable(c *gin.Context) {
+	h.respond(c, func(id int64) (apikey.Key, error) {
+		return h.keys.Disable(c.Request.Context(), id)
+	})
+}
+
+// respond 解析路径里的 Key ID，执行 do，再把结果写回。
+func (h *Handler) respond(c *gin.Context, do func(id int64) (apikey.Key, error)) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest,
+			openai.NewError(openai.TypeInvalidRequest, "invalid_request", "key id must be an integer"))
+		return
+	}
+	key, err := do(id)
+	switch {
+	case errors.Is(err, apikey.ErrNotFound):
+		c.AbortWithStatusJSON(http.StatusNotFound,
+			openai.NewError(openai.TypeInvalidRequest, "key_not_found", "api key not found"))
+	case err != nil:
+		h.internalError(c, "admin request failed", err)
+	default:
+		c.JSON(http.StatusOK, view(key, ""))
+	}
 }
 
 // keyResponse 是 Key 的对外表示。key 字段只在创建时有值，明文不会再出现第二次。

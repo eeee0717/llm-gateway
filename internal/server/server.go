@@ -31,6 +31,9 @@ func New(logger *slog.Logger, rh *relay.Handler, auth gin.HandlerFunc) http.Hand
 func NewAdmin(logger *slog.Logger, ah *admin.Handler, auth gin.HandlerFunc) http.Handler {
 	r := engine(logger, auth)
 	r.POST("/admin/keys", ah.CreateKey)
+	r.GET("/admin/keys/:id", ah.GetKey)
+	r.POST("/admin/keys/:id/credit", ah.Credit)
+	r.POST("/admin/keys/:id/disable", ah.Disable)
 	return r
 }
 
