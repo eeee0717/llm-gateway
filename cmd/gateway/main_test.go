@@ -76,6 +76,25 @@ func TestTwoInstancesDoNotOverspendOneKey(t *testing.T) {
 	require.EqualValues(t, affordable*costPerRequest, cost)
 }
 
+// 流式请求同样走预扣和结算，用量取上游在流末尾报告的那份。
+func TestStreamingRequestIsBilledFromUpstreamUsage(t *testing.T) {
+	db := testdb.New(t)
+	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 5}))
+	t.Cleanup(upstream.Close)
+	gw := startInstance(t, testConfig(upstream.URL), slog.New(slog.DiscardHandler))
+	key, keyID := createKey(t, gw, 1_000_000)
+
+	status, body := chatStream(t, gw.business, key)
+
+	require.Equal(t, http.StatusOK, status)
+	require.Contains(t, body, `"content":"The"`) // 每个 token 一个事件
+	require.Contains(t, body, "[DONE]")
+	records, cost := usageOf(t, db, keyID)
+	require.EqualValues(t, 1, records)
+	require.EqualValues(t, 42, cost) // 1 个 prompt token × 2 + 5 个 completion token × 8
+	require.EqualValues(t, 1_000_000-42, balanceOf(t, db, keyID))
+}
+
 // instance 是一个网关实例的两个端口。
 type instance struct {
 	business string
@@ -153,6 +172,22 @@ func chat(ctx context.Context, url, key string) int {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body) // 响应体读完，连接才能复用
 	return resp.StatusCode
+}
+
+// chatStream 发一个流式请求，读完整个流，返回状态码和收到的内容。
+func chatStream(t *testing.T, url, key string) (int, string) {
+	t.Helper()
+	body := `{"model":"mock-model","stream":true,"messages":[{"role":"user","content":"a"}]}`
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url+"/v1/chat/completions", strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	t.Cleanup(func() { resp.Body.Close() })
+	received, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp.StatusCode, string(received)
 }
 
 func balanceOf(t *testing.T, db *gorm.DB, keyID int64) int64 {
