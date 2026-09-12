@@ -99,12 +99,13 @@ func serve(args []string) error {
 		return err
 	}
 
+	keys := apikey.NewStore(db)
 	rh := relay.New(cfg, logBiller{logger}, logger)
-	ah := admin.New(logger, apikey.NewStore(db))
+	ah := admin.New(logger, keys)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return server.Run(ctx, logger,
-		server.Listener{Name: "business", Addr: cfg.Listen, Handler: server.New(logger, rh)},
+		server.Listener{Name: "business", Addr: cfg.Listen, Handler: server.New(logger, rh, apikey.Middleware(logger, keys))},
 		server.Listener{Name: "admin", Addr: cfg.Admin.Listen, Handler: server.NewAdmin(logger, ah, admin.Auth(cfg.Admin.Key))},
 	)
 }

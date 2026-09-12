@@ -19,9 +19,9 @@ import (
 // shutdownTimeout 是优雅退出时等待进行中请求的最长时间。
 const shutdownTimeout = 30 * time.Second
 
-// New 返回业务端口的处理器。
-func New(logger *slog.Logger, rh *relay.Handler) http.Handler {
-	r := engine(logger)
+// New 返回业务端口的处理器。auth 校验调用方的 API Key，排在公共中间件之后。
+func New(logger *slog.Logger, rh *relay.Handler, auth gin.HandlerFunc) http.Handler {
+	r := engine(logger, auth)
 	r.POST("/v1/chat/completions", rh.ChatCompletions)
 	r.GET("/v1/models", rh.Models)
 	return r

@@ -12,8 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 
+	"github.com/eeee0717/llm-gateway/internal/apikey"
 	"github.com/eeee0717/llm-gateway/internal/config"
 	"github.com/eeee0717/llm-gateway/internal/mockupstream"
 	"github.com/eeee0717/llm-gateway/internal/openai"
@@ -421,9 +423,15 @@ func startGateway(t *testing.T, models map[string]http.Handler) *gateway {
 	}
 	logger := slog.New(slog.DiscardHandler)
 	biller := &recordingBiller{results: make(chan relay.Result, 10)}
-	srv := httptest.NewServer(server.New(logger, relay.New(cfg, biller, logger)))
+	srv := httptest.NewServer(server.New(logger, relay.New(cfg, biller, logger), stubAuth))
 	t.Cleanup(srv.Close)
 	return &gateway{url: srv.URL, biller: biller}
+}
+
+// stubAuth 顶替鉴权中间件：relay 的测试不连数据库，只要 context 里有一个 Key ID 就行。
+func stubAuth(c *gin.Context) {
+	c.Request = c.Request.WithContext(apikey.NewContext(c.Request.Context(), 1))
+	c.Next()
 }
 
 // post 以调用方的身份发一个聊天请求；取消 ctx 就是调用方中途断开。
