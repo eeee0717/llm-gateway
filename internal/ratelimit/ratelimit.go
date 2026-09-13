@@ -38,7 +38,7 @@ if tokens == nil then      -- 没见过这个桶，按满的算
   ts = now
 end
 
--- 按经过的时间补充。时钟可能往回跳，所以经过的时间取不小于零的那部分。
+-- 按经过的时间补充。实例之间的时钟不完全一致，所以经过的时间取不小于零的那部分。
 local elapsed = math.max(0, now - ts)
 tokens = math.min(capacity, tokens + elapsed * capacity / 60000)
 
@@ -51,7 +51,9 @@ else
   retry = math.ceil((1 - tokens) * 60000 / capacity)
 end
 
-redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+-- 记下的时间只进不退。让落后的实例把它拨回去的话，超前的实例下一次就会重新算出一大段
+-- "经过的时间"再补一次，而且每次交替都补，桶等于没有上限。
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', math.max(ts, now))
 redis.call('PEXPIRE', KEYS[1], ttl)
 return {allowed, retry}
 `)

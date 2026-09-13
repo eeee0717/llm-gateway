@@ -79,6 +79,31 @@ func TestTokensRefillOverTime(t *testing.T) {
 	require.Equal(t, 30, allowed)
 }
 
+// 实例之间的时钟不可能完全一致。落后的那个来过之后，不能把桶上记的时间往回拨——
+// 否则超前的实例下一次调用会重新算出一大段"经过的时间"，把桶补满，而且每次交替都补一次，
+// 限流就形同虚设。
+func TestALaggingClockDoesNotRefillTheBucket(t *testing.T) {
+	rdb := testredis.New(t)
+	logger := slog.New(slog.DiscardHandler)
+	ahead := &clock{now: time.Now()}
+	behind := &clock{now: ahead.now.Add(-time.Minute)}
+	fast := ratelimit.New(rdb, ahead.Now, logger)
+	slow := ratelimit.New(rdb, behind.Now, logger)
+	keyID := rand.Int64()
+	drain(t, fast, keyID)
+
+	ok, _ := slow.Allow(t.Context(), keyID, rpm) // 桶是空的，落后的实例同样被拒
+	require.False(t, ok)
+
+	allowed := 0
+	for range rpm {
+		if ok, _ := fast.Allow(t.Context(), keyID, rpm); ok {
+			allowed++
+		}
+	}
+	require.Zero(t, allowed) // 时间没往前走过，一个令牌也不该补回来
+}
+
 // 补充不会超过桶的容量：停一整天回来，也只有一分钟的量。
 func TestRefillStopsAtCapacity(t *testing.T) {
 	l, clock := newLimiter(t)
