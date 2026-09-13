@@ -45,15 +45,16 @@ func Auth(adminKey string) gin.HandlerFunc {
 // CreateKey 处理 POST /admin/keys：新建一个 Key，余额为零。
 func (h *Handler) CreateKey(c *gin.Context) {
 	var body struct {
-		Name string `json:"name"`
+		Name     string `json:"name"`
+		RPMLimit int    `json:"rpm_limit"` // 可选，0 表示用配置里的默认额度
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Name == "" {
+	if err := c.ShouldBindJSON(&body); err != nil || body.Name == "" || body.RPMLimit < 0 {
 		c.AbortWithStatusJSON(http.StatusBadRequest,
-			openai.NewError(openai.TypeInvalidRequest, "invalid_request", "name is required"))
+			openai.NewError(openai.TypeInvalidRequest, "invalid_request", "name is required and rpm_limit must not be negative"))
 		return
 	}
 	plain, hash := apikey.Generate()
-	key, err := h.keys.Create(c.Request.Context(), body.Name, hash)
+	key, err := h.keys.Create(c.Request.Context(), body.Name, hash, body.RPMLimit)
 	if err != nil {
 		h.internalError(c, "create api key", err)
 		return
@@ -80,6 +81,21 @@ func (h *Handler) Credit(c *gin.Context) {
 	}
 	h.respond(c, func(id int64) (apikey.Key, error) {
 		return h.keys.Credit(c.Request.Context(), id, body.AmountMicro)
+	})
+}
+
+// Limit 处理 POST /admin/keys/:id/limit：改这个 Key 的限流额度，0 表示改回跟着配置走。
+func (h *Handler) Limit(c *gin.Context) {
+	var body struct {
+		RPMLimit int `json:"rpm_limit"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.RPMLimit < 0 {
+		c.AbortWithStatusJSON(http.StatusBadRequest,
+			openai.NewError(openai.TypeInvalidRequest, "invalid_request", "rpm_limit must not be negative"))
+		return
+	}
+	h.respond(c, func(id int64) (apikey.Key, error) {
+		return h.keys.SetRPMLimit(c.Request.Context(), id, body.RPMLimit)
 	})
 }
 
@@ -117,6 +133,7 @@ type keyResponse struct {
 	Key          string    `json:"key,omitempty"`
 	BalanceMicro int64     `json:"balance_micro"`
 	Disabled     bool      `json:"disabled"`
+	RPMLimit     int       `json:"rpm_limit"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 
@@ -127,6 +144,7 @@ func view(k apikey.Key, plain string) keyResponse {
 		Key:          plain,
 		BalanceMicro: k.BalanceMicro,
 		Disabled:     k.Disabled,
+		RPMLimit:     k.RPMLimit,
 		CreatedAt:    k.CreatedAt,
 	}
 }

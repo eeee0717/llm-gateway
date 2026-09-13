@@ -18,6 +18,7 @@ type Key struct {
 	KeyHash      string
 	BalanceMicro int64
 	Disabled     bool
+	RPMLimit     int // 每分钟允许的请求数，0 表示用配置里的默认值，见 docs/adr/0004
 	CreatedAt    time.Time
 }
 
@@ -33,9 +34,9 @@ func NewStore(db *gorm.DB) *Store {
 	return &Store{db: db}
 }
 
-// Create 新建一个 Key。余额为零，管理员充值后才能用。
-func (s *Store) Create(ctx context.Context, name, hash string) (Key, error) {
-	key := Key{Name: name, KeyHash: hash}
+// Create 新建一个 Key。余额为零，管理员充值后才能用；rpmLimit 为 0 表示用配置里的默认额度。
+func (s *Store) Create(ctx context.Context, name, hash string, rpmLimit int) (Key, error) {
+	key := Key{Name: name, KeyHash: hash, RPMLimit: rpmLimit}
 	err := s.db.WithContext(ctx).Create(&key).Error
 	return key, err
 }
@@ -53,6 +54,11 @@ func (s *Store) ByID(ctx context.Context, id int64) (Key, error) {
 // Credit 给余额加上 amountMicro，返回更新后的记录。充值是累加，不是设定值。
 func (s *Store) Credit(ctx context.Context, id, amountMicro int64) (Key, error) {
 	return s.update(ctx, `UPDATE api_keys SET balance_micro = balance_micro + ? WHERE id = ? RETURNING *`, amountMicro, id)
+}
+
+// SetRPMLimit 改一个 Key 的限流额度。传 0 表示改回"跟着配置走"。
+func (s *Store) SetRPMLimit(ctx context.Context, id int64, rpm int) (Key, error) {
+	return s.update(ctx, `UPDATE api_keys SET rpm_limit = ? WHERE id = ? RETURNING *`, rpm, id)
 }
 
 // Disable 停用一个 Key，余额保留。

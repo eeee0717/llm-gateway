@@ -26,7 +26,7 @@ func TestCreateStoresHashNotPlainKey(t *testing.T) {
 	store := apikey.NewStore(db)
 	plain, hash := apikey.Generate()
 
-	key, err := store.Create(t.Context(), "alice", hash)
+	key, err := store.Create(t.Context(), "alice", hash, 0)
 
 	require.NoError(t, err)
 	require.NotZero(t, key.ID)

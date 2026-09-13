@@ -95,6 +95,36 @@ func TestCreditAddsToTheBalance(t *testing.T) {
 	require.Empty(t, second.Key)                           // 明文只在创建时返回
 }
 
+// 额度可以在创建时给，也可以后来改。0 表示用配置里的默认值。
+func TestRPMLimitIsSetOnCreateAndUpdated(t *testing.T) {
+	a := startAdmin(t)
+
+	created := decodeKey(t, a.post(t, "/admin/keys", `{"name":"alice","rpm_limit":600}`, adminKey))
+	updated := decodeKey(t, a.post(t, fmt.Sprintf("/admin/keys/%d/limit", created.ID), `{"rpm_limit":30}`, adminKey))
+	cleared := decodeKey(t, a.post(t, fmt.Sprintf("/admin/keys/%d/limit", created.ID), `{"rpm_limit":0}`, adminKey))
+
+	require.Equal(t, 600, created.RPMLimit)
+	require.Equal(t, 30, updated.RPMLimit)
+	require.Zero(t, cleared.RPMLimit) // 0 是"跟着配置走"，不是"一个请求都不许发"
+}
+
+func TestCreateKeyDefaultsToTheConfiguredRPMLimit(t *testing.T) {
+	a := startAdmin(t)
+
+	created := decodeKey(t, a.post(t, "/admin/keys", `{"name":"alice"}`, adminKey))
+
+	require.Zero(t, created.RPMLimit)
+}
+
+func TestLimitRejectsNegativeValues(t *testing.T) {
+	a := startAdmin(t)
+	created := decodeKey(t, a.post(t, "/admin/keys", `{"name":"alice"}`, adminKey))
+
+	resp := a.post(t, fmt.Sprintf("/admin/keys/%d/limit", created.ID), `{"rpm_limit":-1}`, adminKey)
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
 func TestDisableKeepsTheBalance(t *testing.T) {
 	a := startAdmin(t)
 	created := decodeKey(t, a.post(t, "/admin/keys", `{"name":"alice"}`, adminKey))
@@ -125,6 +155,7 @@ func TestAdminRejectsBadKeyIDs(t *testing.T) {
 	// 改余额的两个接口同样要认出"这个 Key 不存在"，而不是当成改了零行就算成功
 	require.Equal(t, http.StatusNotFound, a.post(t, "/admin/keys/999999999/credit", `{"amount_micro":1}`, adminKey).StatusCode)
 	require.Equal(t, http.StatusNotFound, a.post(t, "/admin/keys/999999999/disable", ``, adminKey).StatusCode)
+	require.Equal(t, http.StatusNotFound, a.post(t, "/admin/keys/999999999/limit", `{"rpm_limit":1}`, adminKey).StatusCode)
 }
 
 func TestCreditRequiresAPositiveAmount(t *testing.T) {
@@ -143,6 +174,7 @@ type keyView struct {
 	Key          string `json:"key"`
 	BalanceMicro int64  `json:"balance_micro"`
 	Disabled     bool   `json:"disabled"`
+	RPMLimit     int    `json:"rpm_limit"`
 }
 
 func decodeKey(t *testing.T, resp *http.Response) keyView {

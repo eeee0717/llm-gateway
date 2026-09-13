@@ -18,7 +18,7 @@ import (
 func TestMiddlewarePassesTheKeyToTheHandler(t *testing.T) {
 	store := apikey.NewStore(testdb.New(t))
 	plain, hash := apikey.Generate()
-	key, err := store.Create(t.Context(), "alice", hash)
+	key, err := store.Create(t.Context(), "alice", hash, 0)
 	require.NoError(t, err)
 	url := startAuthed(t, store)
 
@@ -35,7 +35,7 @@ func TestMiddlewarePassesTheKeyToTheHandler(t *testing.T) {
 func TestMiddlewareRejectsBadKeys(t *testing.T) {
 	store := apikey.NewStore(testdb.New(t))
 	disabled, hash := apikey.Generate()
-	key, err := store.Create(t.Context(), "bob", hash)
+	key, err := store.Create(t.Context(), "bob", hash, 0)
 	require.NoError(t, err)
 	require.NoError(t, testdb.New(t).Exec(`UPDATE api_keys SET disabled = TRUE WHERE id = ?`, key.ID).Error)
 	unknown, _ := apikey.Generate()

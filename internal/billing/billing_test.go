@@ -156,7 +156,7 @@ func BenchmarkReserveAndSettle(b *testing.B) {
 	db := testdb.New(b)
 	svc := billing.New(db, prices)
 	_, hash := apikey.Generate()
-	key, err := apikey.NewStore(db).Create(b.Context(), "benchmark", hash)
+	key, err := apikey.NewStore(db).Create(b.Context(), "benchmark", hash, 0)
 	require.NoError(b, err)
 	require.NoError(b, db.Exec(`UPDATE api_keys SET balance_micro = ? WHERE id = ?`, int64(1)<<40, key.ID).Error)
 	ctx := apikey.NewContext(b.Context(), key.ID)
@@ -193,7 +193,7 @@ func newService(t *testing.T) (*billing.Service, *gorm.DB) {
 func keyWithBalance(t *testing.T, db *gorm.DB, balance int64) (context.Context, int64) {
 	t.Helper()
 	_, hash := apikey.Generate()
-	key, err := apikey.NewStore(db).Create(t.Context(), "test key", hash)
+	key, err := apikey.NewStore(db).Create(t.Context(), "test key", hash, 0)
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(`UPDATE api_keys SET balance_micro = ? WHERE id = ?`, balance, key.ID).Error)
 	return apikey.NewContext(t.Context(), key.ID), key.ID
