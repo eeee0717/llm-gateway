@@ -47,6 +47,9 @@ func run(args []string, out io.Writer) error {
 	if *direct == "" || *model == "" {
 		return errors.New("-direct 和 -model 是必填的")
 	}
+	if *n < 1 || *workers < 1 {
+		return errors.New("-n 和 -c 都要大于 0")
+	}
 
 	body, err := requestBody(*model, *extra)
 	if err != nil {

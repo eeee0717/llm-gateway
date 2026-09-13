@@ -75,6 +75,10 @@ type report struct {
 //
 // interval 大于 0 时限速：所有 worker 共用一个 ticker，每发一个请求取一次。
 func measure(ctx context.Context, c *http.Client, targets [2]target, body []byte, n, workers int, interval time.Duration) (report, error) {
+	// 出错时 worker 会提前退出，派生一个自己的 ctx 保证发任务的那个 goroutine 跟着收摊。
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var tick <-chan time.Time
 	if interval > 0 {
 		t := time.NewTicker(interval)
