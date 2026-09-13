@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
@@ -105,6 +106,16 @@ func openDB(dsn string) (*gorm.DB, error) {
 	return gdb, nil
 }
 
+// openRedis 建立 Redis 客户端。连接是按需建立的，所以 Redis 没起来也不影响网关启动：
+// 鉴权缓存会直接回源数据库，限流会放行，见 docs/adr/0002。
+func openRedis(url string) (*redis.Client, error) {
+	opts, err := redis.ParseURL(url)
+	if err != nil {
+		return nil, fmt.Errorf("redis url: %w", err)
+	}
+	return redis.NewClient(opts), nil
+}
+
 // serve 加载配置、组装依赖并启动网关，收到 SIGINT 或 SIGTERM 后优雅退出。
 func serve(args []string) error {
 	cfg, err := loadConfig("serve", args)
@@ -116,6 +127,12 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	rdb, err := openRedis(cfg.Redis.URL)
+	if err != nil {
+		return err
+	}
+	defer rdb.Close()
+	pingRedis(rdb, logger)
 
 	business, management := build(cfg, db, logger)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -124,6 +141,18 @@ func serve(args []string) error {
 		server.Listener{Name: "business", Addr: cfg.Listen, Handler: business},
 		server.Listener{Name: "admin", Addr: cfg.Admin.Listen, Handler: management},
 	)
+}
+
+// pingRedis 在启动时探一下 Redis，连不上只记一条日志：网关照常提供服务，
+// 只是鉴权缓存和限流暂时不起作用。
+func pingRedis(rdb *redis.Client, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		logger.Warn("redis is not reachable, auth cache and rate limit stay off until it recovers", "error", err)
+		return
+	}
+	logger.Info("redis connected")
 }
 
 // build 组装两个端口的处理器。所有依赖都在这里接起来，测试也用它，测的就是真正跑起来的那套装配。

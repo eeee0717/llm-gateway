@@ -18,6 +18,10 @@ admin:
   key_env: TEST_ADMIN_KEY
 database:
   dsn_env: TEST_DATABASE_DSN
+redis:
+  url_env: TEST_REDIS_URL
+rate_limit:
+  default_rpm: 60
 upstreams:
   - name: deepseek
     base_url: https://api.deepseek.com/v1
@@ -37,9 +41,11 @@ func TestLoadReadsSecretsFromEnv(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, &config.Config{
-		Listen:   ":9000",
-		Admin:    config.Admin{Listen: ":9001", KeyEnv: "TEST_ADMIN_KEY", Key: "admin-secret"},
-		Database: config.Database{DSNEnv: "TEST_DATABASE_DSN", DSN: "postgres://localhost/test"},
+		Listen:    ":9000",
+		Admin:     config.Admin{Listen: ":9001", KeyEnv: "TEST_ADMIN_KEY", Key: "admin-secret"},
+		Database:  config.Database{DSNEnv: "TEST_DATABASE_DSN", DSN: "postgres://localhost/test"},
+		Redis:     config.Redis{URLEnv: "TEST_REDIS_URL", URL: "redis://localhost:6379/0"},
+		RateLimit: config.RateLimit{DefaultRPM: 60},
 		Upstreams: []config.Upstream{{
 			Name:    "deepseek",
 			BaseURL: "https://api.deepseek.com/v1",
@@ -80,6 +86,9 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"dsn env not set", strings.Replace(validConfig, "TEST_DATABASE_DSN", "TEST_UNSET_DSN", 1), "TEST_UNSET_DSN"},
 		{"no database", strings.Replace(validConfig, "  dsn_env: TEST_DATABASE_DSN\n", "", 1), "dsn_env"},
 		{"admin key env not set", strings.Replace(validConfig, "TEST_ADMIN_KEY", "TEST_UNSET_ADMIN_KEY", 1), "TEST_UNSET_ADMIN_KEY"},
+		{"redis url env not set", strings.Replace(validConfig, "TEST_REDIS_URL", "TEST_UNSET_REDIS_URL", 1), "TEST_UNSET_REDIS_URL"},
+		{"no redis", strings.Replace(validConfig, "  url_env: TEST_REDIS_URL\n", "", 1), "url_env"},
+		{"rate limit not positive", strings.Replace(validConfig, "default_rpm: 60", "default_rpm: 0", 1), "default_rpm"},
 		{"base url without scheme", strings.Replace(validConfig, "https://", "", 1), "base_url"},
 		{"unknown upstream", strings.Replace(validConfig, "upstream: deepseek", "upstream: openai", 1), `"openai"`},
 		{"duplicate model", validConfig + "  - name: deepseek-chat\n    upstream: deepseek\n", `"deepseek-chat"`},
@@ -99,6 +108,7 @@ func setenv(t *testing.T) {
 	t.Setenv("TEST_DEEPSEEK_KEY", "sk-upstream")
 	t.Setenv("TEST_DATABASE_DSN", "postgres://localhost/test")
 	t.Setenv("TEST_ADMIN_KEY", "admin-secret")
+	t.Setenv("TEST_REDIS_URL", "redis://localhost:6379/0")
 }
 
 func writeConfig(t *testing.T, content string) string {

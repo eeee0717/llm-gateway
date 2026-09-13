@@ -16,6 +16,8 @@ type Config struct {
 	Listen    string     `yaml:"listen"` // 业务端口的监听地址，默认 :8080
 	Admin     Admin      `yaml:"admin"`
 	Database  Database   `yaml:"database"`
+	Redis     Redis      `yaml:"redis"`
+	RateLimit RateLimit  `yaml:"rate_limit"`
 	Upstreams []Upstream `yaml:"upstreams"`
 	Models    []Model    `yaml:"models"`
 }
@@ -31,6 +33,18 @@ type Admin struct {
 type Database struct {
 	DSNEnv string `yaml:"dsn_env"` // 存放连接串的环境变量名
 	DSN    string `yaml:"-"`       // 连接串，加载时从 DSNEnv 读出
+}
+
+// Redis 是 Redis 的连接配置。连接串里可能带口令，所以和数据库一样只写环境变量名，
+// 例如 redis://localhost:6379/0。Redis 只做鉴权缓存和限流，连不上时网关照常工作，见 docs/adr/0002。
+type Redis struct {
+	URLEnv string `yaml:"url_env"` // 存放连接串的环境变量名
+	URL    string `yaml:"-"`       // 连接串，加载时从 URLEnv 读出
+}
+
+// RateLimit 是限流的配置。额度按 Key 算，每个 Key 可以在库里单独设，见 docs/adr/0004。
+type RateLimit struct {
+	DefaultRPM int `yaml:"default_rpm"` // Key 没有单独设额度时，每分钟允许的请求数
 }
 
 // Upstream 是一个上游。
@@ -85,6 +99,12 @@ func (c *Config) resolve() error {
 	}
 	if c.Admin.Key, err = fromEnv("admin", "key_env", c.Admin.KeyEnv); err != nil {
 		return err
+	}
+	if c.Redis.URL, err = fromEnv("redis", "url_env", c.Redis.URLEnv); err != nil {
+		return err
+	}
+	if c.RateLimit.DefaultRPM <= 0 {
+		return errors.New("rate_limit: default_rpm must be positive")
 	}
 
 	upstreams := make(map[string]bool, len(c.Upstreams))
