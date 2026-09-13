@@ -1,0 +1,44 @@
+# 网关配置示例。密钥和数据库连接串都不写在这里，只写存放它们的环境变量名。
+listen: ":8080"
+
+# 管理端口：创建 Key、充值、禁用、查余额。只对内网开放即可。
+admin:
+  listen: ":8081"
+  key_env: ADMIN_KEY
+
+# 本地依赖由 docker compose up -d 提供，对应的连接串是：
+#   export DATABASE_DSN='postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable'
+#   export REDIS_URL='redis://localhost:6379/0'
+database:
+  dsn_env: DATABASE_DSN
+
+# Redis 只做鉴权缓存和限流，连不上时网关照常工作，只是这两样暂时不起作用。
+redis:
+  url_env: REDIS_URL
+
+# Key 没有单独设额度时，每分钟允许的请求数。
+rate_limit:
+  default_rpm: 60
+
+upstreams:
+  # 本地 mock 上游：go run ./cmd/mockupstream
+  - name: mock
+    base_url: http://localhost:9090/v1
+    key_env: MOCK_API_KEY
+  # 地址也可以只写变量名，用 base_url_env 代替 base_url：
+  # - name: deepseek
+  #   base_url_env: UPSTREAM_BASE_URL
+  #   key_env: UPSTREAM_API_KEY
+
+# 单价的单位是元每百万 token；default_max_tokens 是调用方没指定输出上限时的默认值，预扣按它计算。
+models:
+  - name: mock-model
+    upstream: mock
+    input_price: 2
+    output_price: 8
+    default_max_tokens: 4096
+  # - name: deepseek-chat
+  #   upstream: deepseek
+  #   input_price: 2
+  #   output_price: 8
+  #   default_max_tokens: 4096

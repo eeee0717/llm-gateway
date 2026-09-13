@@ -1,0 +1,234 @@
+package admin_test
+
+import (
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+
+	"github.com/eeee0717/llm-gateway/internal/admin"
+	"github.com/eeee0717/llm-gateway/internal/apikey"
+	"github.com/eeee0717/llm-gateway/internal/server"
+	"github.com/eeee0717/llm-gateway/internal/testdb"
+	"github.com/eeee0717/llm-gateway/internal/testredis"
+)
+
+const adminKey = "admin-secret"
+
+func TestCreateKeyReturnsThePlainKeyOnce(t *testing.T) {
+	a := startAdmin(t)
+
+	resp := a.post(t, "/admin/keys", `{"name":"alice"}`, adminKey)
+
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	created := decodeKey(t, resp)
+	require.True(t, strings.HasPrefix(created.Key, "sk-"))
+	require.Equal(t, "alice", created.Name)
+	require.Zero(t, created.BalanceMicro) // 新建的 Key 余额为零
+	require.False(t, created.Disabled)
+
+	// 返回的明文对应库里那条记录，而库里存的是它的哈希
+	var name string
+	require.NoError(t, a.db.Raw(`SELECT name FROM api_keys WHERE key_hash = ?`, apikey.Hash(created.Key)).Scan(&name).Error)
+	require.Equal(t, "alice", name)
+}
+
+func TestAdminRejectsRequestsWithoutTheAdminKey(t *testing.T) {
+	a := startAdmin(t)
+
+	name := rand.Text() // 库是所有测试共用的，名字取唯一的，下面才数得准
+
+	for _, tc := range []struct{ name, key string }{
+		{"no key", ""},
+		{"wrong key", "admin-wrong"},
+		{"api key instead of admin key", "sk-caller-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := a.post(t, "/admin/keys", `{"name":"`+name+`"}`, tc.key)
+			require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+		})
+	}
+
+	require.Zero(t, countKeysNamed(t, a, name)) // 鉴权不通过时不会建出 Key
+}
+
+// Authorization 头必须写成 Bearer 形式，裸密钥不算数：协议只有一种写法，鉴权就只认一种。
+func TestAdminRequiresTheBearerScheme(t *testing.T) {
+	a := startAdmin(t)
+	name := rand.Text()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, a.url+"/admin/keys", strings.NewReader(`{"name":"`+name+`"}`))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", adminKey) // 密钥对，但没有 Bearer 前缀
+
+	resp, err := http.DefaultClient.Do(req)
+
+	require.NoError(t, err)
+	t.Cleanup(func() { resp.Body.Close() })
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	require.Zero(t, countKeysNamed(t, a, name))
+}
+
+func TestCreateKeyRequiresName(t *testing.T) {
+	a := startAdmin(t)
+
+	resp := a.post(t, "/admin/keys", `{}`, adminKey)
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestCreditAddsToTheBalance(t *testing.T) {
+	a := startAdmin(t)
+	created := decodeKey(t, a.post(t, "/admin/keys", `{"name":"alice"}`, adminKey))
+	path := fmt.Sprintf("/admin/keys/%d/credit", created.ID)
+
+	first := decodeKey(t, a.post(t, path, `{"amount_micro":1000000}`, adminKey))
+	second := decodeKey(t, a.post(t, path, `{"amount_micro":500000}`, adminKey))
+
+	require.EqualValues(t, 1_000_000, first.BalanceMicro)
+	require.EqualValues(t, 1_500_000, second.BalanceMicro) // 充值是累加
+	require.Empty(t, second.Key)                           // 明文只在创建时返回
+}
+
+// 额度可以在创建时给，也可以后来改。0 表示用配置里的默认值。
+func TestRPMLimitIsSetOnCreateAndUpdated(t *testing.T) {
+	a := startAdmin(t)
+
+	created := decodeKey(t, a.post(t, "/admin/keys", `{"name":"alice","rpm_limit":600}`, adminKey))
+	updated := decodeKey(t, a.post(t, fmt.Sprintf("/admin/keys/%d/limit", created.ID), `{"rpm_limit":30}`, adminKey))
+	cleared := decodeKey(t, a.post(t, fmt.Sprintf("/admin/keys/%d/limit", created.ID), `{"rpm_limit":0}`, adminKey))
+
+	require.Equal(t, 600, created.RPMLimit)
+	require.Equal(t, 30, updated.RPMLimit)
+	require.Zero(t, cleared.RPMLimit) // 0 是"跟着配置走"，不是"一个请求都不许发"
+}
+
+func TestCreateKeyDefaultsToTheConfiguredRPMLimit(t *testing.T) {
+	a := startAdmin(t)
+
+	created := decodeKey(t, a.post(t, "/admin/keys", `{"name":"alice"}`, adminKey))
+
+	require.Zero(t, created.RPMLimit)
+}
+
+func TestLimitRejectsNegativeValues(t *testing.T) {
+	a := startAdmin(t)
+	created := decodeKey(t, a.post(t, "/admin/keys", `{"name":"alice"}`, adminKey))
+
+	resp := a.post(t, fmt.Sprintf("/admin/keys/%d/limit", created.ID), `{"rpm_limit":-1}`, adminKey)
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestDisableKeepsTheBalance(t *testing.T) {
+	a := startAdmin(t)
+	created := decodeKey(t, a.post(t, "/admin/keys", `{"name":"alice"}`, adminKey))
+	a.post(t, fmt.Sprintf("/admin/keys/%d/credit", created.ID), `{"amount_micro":1000000}`, adminKey)
+
+	disabled := decodeKey(t, a.post(t, fmt.Sprintf("/admin/keys/%d/disable", created.ID), ``, adminKey))
+
+	require.True(t, disabled.Disabled)
+	require.EqualValues(t, 1_000_000, disabled.BalanceMicro) // 禁用只是停用，余额保留
+}
+
+func TestGetKeyReturnsBalanceWithoutThePlainKey(t *testing.T) {
+	a := startAdmin(t)
+	created := decodeKey(t, a.post(t, "/admin/keys", `{"name":"alice"}`, adminKey))
+
+	got := decodeKey(t, a.get(t, fmt.Sprintf("/admin/keys/%d", created.ID), adminKey))
+
+	require.Equal(t, created.ID, got.ID)
+	require.Equal(t, "alice", got.Name)
+	require.Empty(t, got.Key) // 明文没有第二次机会
+}
+
+func TestAdminRejectsBadKeyIDs(t *testing.T) {
+	a := startAdmin(t)
+
+	require.Equal(t, http.StatusNotFound, a.get(t, "/admin/keys/999999999", adminKey).StatusCode)
+	require.Equal(t, http.StatusBadRequest, a.get(t, "/admin/keys/abc", adminKey).StatusCode)
+	// 改余额的两个接口同样要认出"这个 Key 不存在"，而不是当成改了零行就算成功
+	require.Equal(t, http.StatusNotFound, a.post(t, "/admin/keys/999999999/credit", `{"amount_micro":1}`, adminKey).StatusCode)
+	require.Equal(t, http.StatusNotFound, a.post(t, "/admin/keys/999999999/disable", ``, adminKey).StatusCode)
+	require.Equal(t, http.StatusNotFound, a.post(t, "/admin/keys/999999999/limit", `{"rpm_limit":1}`, adminKey).StatusCode)
+}
+
+func TestCreditRequiresAPositiveAmount(t *testing.T) {
+	a := startAdmin(t)
+	created := decodeKey(t, a.post(t, "/admin/keys", `{"name":"alice"}`, adminKey))
+	path := fmt.Sprintf("/admin/keys/%d/credit", created.ID)
+
+	require.Equal(t, http.StatusBadRequest, a.post(t, path, `{"amount_micro":0}`, adminKey).StatusCode)
+	require.Equal(t, http.StatusBadRequest, a.post(t, path, `{"amount_micro":-1}`, adminKey).StatusCode)
+}
+
+// keyView 是管理接口返回的 Key 信息。
+type keyView struct {
+	ID           int64  `json:"id"`
+	Name         string `json:"name"`
+	Key          string `json:"key"`
+	BalanceMicro int64  `json:"balance_micro"`
+	Disabled     bool   `json:"disabled"`
+	RPMLimit     int    `json:"rpm_limit"`
+}
+
+func decodeKey(t *testing.T, resp *http.Response) keyView {
+	t.Helper()
+	var view keyView
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&view))
+	return view
+}
+
+func countKeysNamed(t *testing.T, a *adminServer, name string) int64 {
+	t.Helper()
+	var count int64
+	require.NoError(t, a.db.Raw(`SELECT count(*) FROM api_keys WHERE name = ?`, name).Scan(&count).Error)
+	return count
+}
+
+type adminServer struct {
+	url string
+	db  *gorm.DB
+}
+
+func startAdmin(t *testing.T) *adminServer {
+	t.Helper()
+	db := testdb.New(t)
+	logger := slog.New(slog.DiscardHandler)
+	keys := apikey.NewStore(db)
+	cache := apikey.NewCache(testredis.New(t), keys, logger)
+	srv := httptest.NewServer(server.NewAdmin(logger, admin.New(logger, keys, cache), admin.Auth(adminKey)))
+	t.Cleanup(srv.Close)
+	return &adminServer{url: srv.URL, db: db}
+}
+
+// post 以管理员的身份发一个请求；key 为空表示不带 Authorization 头。
+func (a *adminServer) post(t *testing.T, path, body, key string) *http.Response {
+	t.Helper()
+	return a.do(t, http.MethodPost, path, body, key)
+}
+
+func (a *adminServer) get(t *testing.T, path, key string) *http.Response {
+	t.Helper()
+	return a.do(t, http.MethodGet, path, "", key)
+}
+
+func (a *adminServer) do(t *testing.T, method, path, body, key string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), method, a.url+path, strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}

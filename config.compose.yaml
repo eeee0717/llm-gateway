@@ -1,0 +1,28 @@
+# docker compose 一键启动时网关用的配置：上游是同一个 compose 里的 mock，
+# 不需要任何真实密钥就能把整套跑起来。
+listen: ":8080"
+
+admin:
+  listen: ":8081"
+  key_env: ADMIN_KEY
+
+database:
+  dsn_env: DATABASE_DSN
+
+redis:
+  url_env: REDIS_URL
+
+rate_limit:
+  default_rpm: 60
+
+upstreams:
+  - name: mock
+    base_url: http://mockupstream:9090/v1
+    key_env: MOCK_API_KEY
+
+models:
+  - name: mock-model
+    upstream: mock
+    input_price: 2
+    output_price: 8
+    default_max_tokens: 64

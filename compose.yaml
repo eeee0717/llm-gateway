@@ -1,0 +1,80 @@
+# 默认只起网关依赖的 PostgreSQL 和 Redis，本地开发和 go test 连的就是这一套：
+#   docker compose up -d
+# 加上 full 这个 profile 会连网关、mock 上游一起起来，不需要任何真实密钥：
+#   docker compose --profile full up -d --build
+#
+# 数据库口令是本地开发用的固定值，不是密钥。端口只绑在回环地址上，
+# 同一个网络里的其他机器连不到这几个没设防的服务。
+# 网关和迁移跑的是同一个镜像、同一份配置、同一组环境变量，写一次就够。
+x-gateway: &gateway
+  build: .
+  image: llm-gateway:local
+  profiles: ["full"]
+  volumes:
+    - ./config.compose.yaml:/etc/gateway/config.yaml:ro
+  environment:
+    DATABASE_DSN: postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable
+    REDIS_URL: redis://redis:6379/0
+    ADMIN_KEY: ${ADMIN_KEY:-local-admin-key}
+    MOCK_API_KEY: mock
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # PG 18 起数据目录在 /var/lib/postgresql 下按主版本号分子目录，卷要挂在上一层
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # 压测和演示的对照上游，首 token 延迟固定，测出来的差值才干净。
+  mockupstream:
+    build: .
+    image: llm-gateway:local
+    profiles: ["full"]
+    entrypoint: ["/mockupstream"]
+    command: ["-addr", ":9090", "-first-delay", "300ms", "-tokens", "20", "-token-delay", "30ms"]
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  # 迁移单独成一个服务，跑完就退出；网关等它成功之后才启动。
+  migrate:
+    <<: *gateway
+    command: ["migrate", "-config", "/etc/gateway/config.yaml"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  gateway:
+    <<: *gateway
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
