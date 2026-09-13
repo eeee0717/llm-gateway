@@ -23,6 +23,9 @@ import (
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return // flag 包已经把用法打出来了
+		}
 		fmt.Fprintln(os.Stderr, "loadtest:", err)
 		os.Exit(1)
 	}

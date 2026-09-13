@@ -36,6 +36,9 @@ const usage = "usage: gateway serve|migrate [-config config.yaml]"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return // flag 包已经把用法打出来了
+		}
 		fmt.Fprintln(os.Stderr, "gateway:", err)
 		os.Exit(1)
 	}
