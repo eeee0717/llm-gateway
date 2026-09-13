@@ -10,7 +10,7 @@ OpenAI 兼容的 LLM 网关。调用方拿一个 API Key 调用多个上游的�
 - 多个上游按模型路由，每个模型固定走一个上游
 - 管理接口单开一个端口：建 Key、充值、改额度、禁用、查余额
 
-单体 Go 服务，非测试代码约 2000 行。技术栈：Gin、PostgreSQL（GORM + pgx）、Redis（go-redis）、goose 迁移、`log/slog`。
+单体 Go 服务，非测试代码约 2200 行。技术栈：Gin、PostgreSQL（GORM + pgx）、Redis（go-redis）、goose 迁移、`log/slog`。
 
 ## 跑起来
 
@@ -20,7 +20,7 @@ OpenAI 兼容的 LLM 网关。调用方拿一个 API Key 调用多个上游的�
 docker compose --profile full up -d --build
 ```
 
-起了五个容器：PostgreSQL、Redis、mock 上游、执行迁移的一次性容器，以及网关本身（业务端口 8080，管理端口 8081）。
+起 PostgreSQL、Redis、mock 上游和网关（业务端口 8080，管理端口 8081），迁移由一个跑完就退出的容器执行，网关等它成功之后才启动。等到 `docker compose logs gateway` 里出现 `listening` 就可以打了。
 
 建一个 Key 并充值 100 元：
 
@@ -77,7 +77,7 @@ curl -N -X POST localhost:8080/v1/chat/completions \
 
 ### 吞吐与瓶颈
 
-同一个压测程序换个模式（`-mode throughput`），mock 不加延迟，50 并发各打 20 秒：
+同一个压测程序换个模式（`-mode throughput`），mock 不加延迟，50 并发各打 20 秒。这里的 p50/p99 是整个请求读完的耗时，不是上面那个首 token 延迟：
 
 | 被压的一端 | QPS | p50 | p99 |
 |---|---|---|---|

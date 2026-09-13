@@ -53,6 +53,9 @@ func run(args []string) error {
 		return serve(args[1:])
 	case "migrate":
 		return migrate(args[1:])
+	case "-h", "--help", "help":
+		fmt.Println(usage)
+		return nil
 	default:
 		return fmt.Errorf("unknown command %q\n%s", args[0], usage)
 	}

@@ -121,6 +121,10 @@ func (c *Config) resolve() error {
 
 		what := fmt.Sprintf("upstream %q", u.Name)
 		// 地址也可以只写变量名：私有的中转地址不一定想写进配置文件。
+		// 两种写法同时出现就说不清以谁为准了，直接拒掉。
+		if u.BaseURL != "" && u.BaseURLEnv != "" {
+			return fmt.Errorf("%s: set either base_url or base_url_env, not both", what)
+		}
 		if u.BaseURLEnv != "" {
 			if u.BaseURL, err = fromEnv(what, "base_url_env", u.BaseURLEnv); err != nil {
 				return err

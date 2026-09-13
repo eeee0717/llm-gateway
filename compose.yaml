@@ -5,6 +5,19 @@
 #
 # 数据库口令是本地开发用的固定值，不是密钥。端口只绑在回环地址上，
 # 同一个网络里的其他机器连不到这几个没设防的服务。
+# 网关和迁移跑的是同一个镜像、同一份配置、同一组环境变量，写一次就够。
+x-gateway: &gateway
+  build: .
+  image: llm-gateway:local
+  profiles: ["full"]
+  volumes:
+    - ./config.compose.yaml:/etc/gateway/config.yaml:ro
+  environment:
+    DATABASE_DSN: postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable
+    REDIS_URL: redis://redis:6379/0
+    ADMIN_KEY: ${ADMIN_KEY:-local-admin-key}
+    MOCK_API_KEY: mock
+
 services:
   postgres:
     image: postgres:18-alpine
@@ -35,8 +48,9 @@ services:
 
   # 压测和演示的对照上游，首 token 延迟固定，测出来的差值才干净。
   mockupstream:
-    profiles: ["full"]
     build: .
+    image: llm-gateway:local
+    profiles: ["full"]
     entrypoint: ["/mockupstream"]
     command: ["-addr", ":9090", "-first-delay", "300ms", "-tokens", "20", "-token-delay", "30ms"]
     ports:
@@ -44,34 +58,18 @@ services:
 
   # 迁移单独成一个服务，跑完就退出；网关等它成功之后才启动。
   migrate:
-    profiles: ["full"]
-    build: .
+    <<: *gateway
     command: ["migrate", "-config", "/etc/gateway/config.yaml"]
-    volumes:
-      - ./config.compose.yaml:/etc/gateway/config.yaml:ro
-    environment:
-      DATABASE_DSN: postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable
-      REDIS_URL: redis://redis:6379/0
-      ADMIN_KEY: ${ADMIN_KEY:-local-admin-key}
-      MOCK_API_KEY: mock
     depends_on:
       postgres:
         condition: service_healthy
     restart: "no"
 
   gateway:
-    profiles: ["full"]
-    build: .
+    <<: *gateway
     ports:
       - "127.0.0.1:8080:8080"
       - "127.0.0.1:8081:8081"
-    volumes:
-      - ./config.compose.yaml:/etc/gateway/config.yaml:ro
-    environment:
-      DATABASE_DSN: postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable
-      REDIS_URL: redis://redis:6379/0
-      ADMIN_KEY: ${ADMIN_KEY:-local-admin-key}
-      MOCK_API_KEY: mock
     depends_on:
       migrate:
         condition: service_completed_successfully
