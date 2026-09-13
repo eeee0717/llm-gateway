@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -37,7 +38,7 @@ func run(args []string, out io.Writer) error {
 		direct     = fs.String("direct", "", "直连上游的地址，到 /v1 为止")
 		directKey  = fs.String("direct-key", "", "直连上游用的密钥")
 		gateway    = fs.String("gateway", "http://localhost:8080/v1", "网关的地址，到 /v1 为止")
-		gatewayKey = fs.String("gateway-key", "", "网关的 API Key")
+		gatewayKey = fs.String("gateway-key", "", "网关的 API Key；用逗号分隔多个，请求轮流用，避开同一行上的预扣排队")
 		model      = fs.String("model", "", "模型名，两端一致")
 		n          = fs.Int("n", 200, "采样对数，每对在两端各打一次")
 		workers    = fs.Int("c", 10, "并发")
@@ -59,8 +60,8 @@ func run(args []string, out io.Writer) error {
 		return err
 	}
 	targets := [2]target{
-		{Name: "direct", URL: *direct, Key: *directKey},
-		{Name: "gateway", URL: *gateway, Key: *gatewayKey},
+		{Name: "direct", URL: *direct, Keys: keys(*directKey)},
+		{Name: "gateway", URL: *gateway, Keys: keys(*gatewayKey)},
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -89,6 +90,17 @@ func requestBody(model, extra string) ([]byte, error) {
 	body["stream"] = true
 	body["messages"] = []map[string]string{{"role": "user", "content": "hi"}}
 	return json.Marshal(body)
+}
+
+// keys 把逗号分隔的密钥拆开，顺带丢掉空的。
+func keys(s string) []string {
+	var out []string
+	for k := range strings.SplitSeq(s, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // newClient 的连接池要装得下所有 worker：默认每个主机只留 2 条空闲连接，

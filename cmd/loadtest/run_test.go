@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,7 +24,7 @@ func TestMeasuresTimeToFirstEventNotTheWholeStream(t *testing.T) {
 	}))
 	defer up.Close()
 
-	got, err := firstEventLatency(t.Context(), http.DefaultClient, target{URL: up.URL + "/v1"}, probe)
+	got, err := firstEventLatency(t.Context(), http.DefaultClient, up.URL+"/v1", "", probe)
 
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, got, 200*time.Millisecond)
@@ -35,7 +36,7 @@ func TestFailedRequestIsAnErrorNotASample(t *testing.T) {
 	up := httptest.NewServer(mockupstream.New(mockupstream.Options{FailStatus: http.StatusInternalServerError}))
 	defer up.Close()
 
-	_, err := firstEventLatency(t.Context(), http.DefaultClient, target{URL: up.URL + "/v1"}, probe)
+	_, err := firstEventLatency(t.Context(), http.DefaultClient, up.URL+"/v1", "", probe)
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "500")
@@ -95,4 +96,32 @@ func TestReportsTheLatencyTheMiddleLayerAdds(t *testing.T) {
 	require.NoError(t, err)
 	extra := summarize(got.Samples[1]).P50 - summarize(got.Samples[0]).P50
 	require.InDelta(t, float64(60*time.Millisecond), float64(extra), float64(30*time.Millisecond))
+}
+
+// 多个 Key 轮流用。压测打同一个 Key 时，预扣会在同一行上排队，
+// 测出来的是行锁而不是网关的处理能力。
+func TestKeysAreUsedInTurn(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]int{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen[r.Header.Get("Authorization")]++
+		mu.Unlock()
+		mockupstream.New(mockupstream.Options{Tokens: 2}).ServeHTTP(w, r)
+	}))
+	defer up.Close()
+	both := [2]target{
+		{Name: "direct", URL: up.URL + "/v1"},
+		{Name: "gateway", URL: up.URL + "/v1", Keys: []string{"k1", "k2", "k3"}},
+	}
+
+	_, err := measure(t.Context(), http.DefaultClient, both, probe, 6, 1, 0)
+
+	require.NoError(t, err)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 2, seen["Bearer k1"])
+	require.Equal(t, 2, seen["Bearer k2"])
+	require.Equal(t, 2, seen["Bearer k3"])
+	require.Equal(t, 6, seen[""]) // direct 那端不带 Authorization
 }
