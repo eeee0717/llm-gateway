@@ -25,6 +25,7 @@ import (
 	"github.com/eeee0717/llm-gateway/internal/apikey"
 	"github.com/eeee0717/llm-gateway/internal/billing"
 	"github.com/eeee0717/llm-gateway/internal/config"
+	"github.com/eeee0717/llm-gateway/internal/ratelimit"
 	"github.com/eeee0717/llm-gateway/internal/relay"
 	"github.com/eeee0717/llm-gateway/internal/requestid"
 	"github.com/eeee0717/llm-gateway/internal/server"
@@ -159,10 +160,29 @@ func pingRedis(rdb *redis.Client, logger *slog.Logger) {
 func build(cfg *config.Config, db *gorm.DB, rdb *redis.Client, logger *slog.Logger) (business, management http.Handler) {
 	keys := apikey.NewStore(db)
 	cache := apikey.NewCache(rdb, keys, logger)
+	limiter := ratelimit.New(rdb, time.Now, logger)
 	rh := relay.New(cfg, biller{billing.New(db, prices(cfg))}, logger)
 	ah := admin.New(logger, keys, cache)
-	return server.New(logger, rh, apikey.Middleware(logger, cache)),
+	return server.New(logger, rh,
+			apikey.Middleware(logger, cache),
+			ratelimit.Middleware(limiter, caller(cfg.RateLimit.DefaultRPM))),
 		server.NewAdmin(logger, ah, admin.Auth(cfg.Admin.Key))
+}
+
+// caller 把鉴权的结果变成限流认的调用方：额度用这个 Key 自己设的，没设就用配置里的默认值。
+// 限流不认识 API Key 是怎么来的，两个包在这里接起来。
+func caller(defaultRPM int) ratelimit.Caller {
+	return func(ctx context.Context) (int64, int, bool) {
+		identity, ok := apikey.From(ctx)
+		if !ok {
+			return 0, 0, false
+		}
+		rpm := identity.RPM
+		if rpm <= 0 {
+			rpm = defaultRPM
+		}
+		return identity.ID, rpm, true
+	}
 }
 
 // biller 把 billing.Service 接到 relay.Biller 上。两个包各自定义自己的类型，谁也不 import 谁，

@@ -26,9 +26,10 @@ const (
 	settleGrace = 5 * time.Second
 )
 
-// New 返回业务端口的处理器。auth 校验调用方的 API Key，排在公共中间件之后。
-func New(logger *slog.Logger, rh *relay.Handler, auth gin.HandlerFunc) http.Handler {
-	r := engine(logger, auth)
+// New 返回业务端口的处理器。mw 是这个端口特有的中间件，排在公共中间件之后，
+// 顺序就是请求经过它们的顺序：先鉴权，再限流。
+func New(logger *slog.Logger, rh *relay.Handler, mw ...gin.HandlerFunc) http.Handler {
+	r := engine(logger, mw...)
 	r.POST("/v1/chat/completions", rh.ChatCompletions)
 	r.GET("/v1/models", rh.Models)
 	return r

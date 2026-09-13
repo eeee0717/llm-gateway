@@ -135,6 +135,46 @@ func TestDisabledKeyStopsWorkingImmediatelyOnEveryInstance(t *testing.T) {
 	}
 }
 
+// M3 收口断言：限流放行的请求总数正确。
+// 把这个 Key 的额度设成每分钟 6 个，瞬间打 300 个请求：桶一开始是满的，正好放行 6 个，其余都被拒。
+//
+// 这里用的是真实时钟，所以额度要取小：额度 6 意味着每 10 秒才补回一个令牌，
+// 整个测试跑完连一秒都不到，补充的量远不足一个，放行数就是个确定的数。
+// 额度取 60 的话每秒就补一个，测试稍微慢一点就会多放行一个。
+// 精确到"一个令牌"的补充行为由 internal/ratelimit 的测试用注入的时钟去断言。
+func TestRateLimitAllowsExactlyTheKeyQuota(t *testing.T) {
+	const (
+		requests = 300
+		quota    = 6
+	)
+	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
+	t.Cleanup(upstream.Close)
+	gw := startInstance(t, testConfig(upstream.URL), slog.New(slog.DiscardHandler))
+	key, keyID := createKey(t, gw, 1_000_000_000) // 余额给够，被拒只可能是限流
+	adminPost(t, gw.admin, fmt.Sprintf("/admin/keys/%d/limit", keyID), fmt.Sprintf(`{"rpm_limit":%d}`, quota), nil)
+
+	var allowed, rejected atomic.Int64
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			switch chat(t.Context(), gw.business, key) {
+			case http.StatusOK:
+				allowed.Add(1)
+			case http.StatusTooManyRequests:
+				rejected.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	require.EqualValues(t, quota, allowed.Load())
+	require.EqualValues(t, requests-quota, rejected.Load())
+	_, code := chatOnce(t, gw.business, key)
+	require.Equal(t, "rate_limit_exceeded", code) // 是限流拒的，不是余额不够
+}
+
 // instance 是一个网关实例的两个端口。
 type instance struct {
 	business string
@@ -156,7 +196,9 @@ func startInstance(t *testing.T, cfg *config.Config, logger *slog.Logger) instan
 
 func testConfig(upstreamURL string) *config.Config {
 	return &config.Config{
-		Admin:     config.Admin{Key: adminKey},
+		Admin: config.Admin{Key: adminKey},
+		// 默认额度给得很大，只有专门测限流的用例才去设 Key 自己的额度
+		RateLimit: config.RateLimit{DefaultRPM: 100_000},
 		Upstreams: []config.Upstream{{Name: "mock", BaseURL: upstreamURL + "/v1", Key: "upstream-key"}},
 		Models: []config.Model{{
 			Name:             "mock-model",
