@@ -1,5 +1,7 @@
 # llm-gateway
 
+[![CI](https://github.com/eeee0717/llm-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/eeee0717/llm-gateway/actions/workflows/ci.yml)
+
 OpenAI 兼容的 LLM 网关。调用方拿一个 API Key 调用多个上游的模型，网关负责鉴权、限流、转发，并按实际用量从余额里扣费。
 
 - `POST /v1/chat/completions`，流式与非流式；SSE 事件原样透传，调用方看到的流和直连上游时等价
