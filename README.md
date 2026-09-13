@@ -101,6 +101,8 @@ curl -N -X POST localhost:8080/v1/chat/completions \
 
 余额只有 PostgreSQL 一份，Redis 里的东西丢光了也只是慢一点、不会算错账，所以 Redis 故障时网关照常工作（[ADR-0002](docs/adr/0002-balance-in-postgres-only.md)）。
 
+至于"慢一点"是多少，实测过：把鉴权缓存摘掉，纯鉴权路径从 0.204ms 变成 0.228ms，**只差 0.02 毫秒**——PostgreSQL 那条查询走唯一索引、内存命中，本来就只要 0.011 毫秒。这层缓存买到的不是当下的速度，而是把读流量从最难水平扩的那一层挪走（[auth-cache](docs/notes/auth-cache.md)）。
+
 ## 本地开发
 
 工具链由 `mise.toml` 固定：
