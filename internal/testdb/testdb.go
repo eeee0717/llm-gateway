@@ -53,5 +53,9 @@ func open() {
 	if db, openErr = sharedDB.DB(); openErr != nil {
 		return
 	}
+	// 这个池只服务测试自己的辅助查询——建 Key、查余额、查用量记录——都是一条一条来的。
+	// 不设上限的话它会跟着被测的网关一起涨，两边抢同一批连接，
+	// 先撞上 PostgreSQL 连接上限的可能是任何一方，排查起来就没了准头。
+	db.SetMaxOpenConns(4)
 	openErr = migrations.Up(db)
 }

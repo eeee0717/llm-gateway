@@ -305,6 +305,14 @@ func startInstanceWith(t *testing.T, cfg *config.Config, rdb *redis.Client, logg
 	t.Helper()
 	db, err := openDB(testdb.DSN())
 	require.NoError(t, err)
+	// 实例用完要把连接池还回去。测试是一个进程跑完所有用例，池子不关就一路攒着；
+	// 攒过 PostgreSQL 的连接上限之后，后面的用例会莫名其妙地拿不到连接。
+	// Cleanup 是后进先出，下面注册的两个 server 会先停，不会有请求撞上关掉的池子。
+	t.Cleanup(func() {
+		pool, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, pool.Close())
+	})
 	business, management := build(cfg, db, rdb, logger)
 	b := httptest.NewServer(business)
 	t.Cleanup(b.Close)
