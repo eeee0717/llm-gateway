@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -46,7 +47,7 @@ func TestTwoInstancesDoNotOverspendOneKey(t *testing.T) {
 		credited = 500 * reservedPerRequest
 	)
 	db := testdb.New(t) // 顺带把迁移跑好
-	logger := slog.New(slog.DiscardHandler)
+	logger := testLogger(t)
 	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
 	t.Cleanup(upstream.Close)
 	cfg := testConfig(upstream.URL)
@@ -54,7 +55,7 @@ func TestTwoInstancesDoNotOverspendOneKey(t *testing.T) {
 	first, second := startInstance(t, cfg, logger), startInstance(t, cfg, logger)
 	key, keyID := createKey(t, first, credited)
 
-	var succeeded, rejected, unexpected atomic.Int64
+	var got tally
 	var wg sync.WaitGroup
 	for i := range requests {
 		wg.Add(1)
@@ -64,32 +65,25 @@ func TestTwoInstancesDoNotOverspendOneKey(t *testing.T) {
 			if i%2 == 1 {
 				instance = second
 			}
-			switch chat(t.Context(), instance.business, key) {
-			case http.StatusOK:
-				succeeded.Add(1)
-			case http.StatusTooManyRequests:
-				rejected.Add(1)
-			default:
-				unexpected.Add(1)
-			}
+			got.record(chat(t.Context(), instance.business, key))
 		}()
 	}
 	wg.Wait()
 
-	require.Zero(t, unexpected.Load()) // 每个请求要么成功，要么因为余额不够被拒
-	require.EqualValues(t, requests, succeeded.Load()+rejected.Load())
+	require.Empty(t, got.unexpected) // 每个请求要么成功，要么因为余额不够被拒
+	require.Equal(t, requests, got.ok+got.rejected)
 
 	balance := balanceOf(t, db, keyID)
 	records, cost := usageOf(t, db, keyID)
 	require.GreaterOrEqual(t, balance, int64(0))         // 零超扣
 	require.EqualValues(t, credited, balance+cost)       // 账目守恒
-	require.EqualValues(t, succeeded.Load(), records)    // 每个成功的请求留下一条用量记录
+	require.EqualValues(t, got.ok, records)              // 每个成功的请求留下一条用量记录
 	require.EqualValues(t, records*costPerRequest, cost) // 每条记录的费用都是实际用量算出来的
 
 	// 成功的次数落在一个算得出来的区间里：最少是按预扣金额能支付的次数（退款一次都还没发生），
 	// 最多是按实际费用能支付的次数（每次预扣之前差额都已经退回来了）。
-	require.GreaterOrEqual(t, succeeded.Load(), int64(credited/reservedPerRequest))
-	require.LessOrEqual(t, succeeded.Load(), int64(credited/costPerRequest))
+	require.GreaterOrEqual(t, got.ok, credited/reservedPerRequest)
+	require.LessOrEqual(t, got.ok, credited/costPerRequest)
 }
 
 // 流式请求同样走预扣和结算，用量取上游在流末尾报告的那份。
@@ -98,7 +92,7 @@ func TestStreamingRequestIsBilledFromUpstreamUsage(t *testing.T) {
 	db := testdb.New(t)
 	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
 	t.Cleanup(upstream.Close)
-	gw := startInstance(t, testConfig(upstream.URL), slog.New(slog.DiscardHandler))
+	gw := startInstance(t, testConfig(upstream.URL), testLogger(t))
 	key, keyID := createKey(t, gw, credited)
 
 	status, body := chatStream(t, gw.business, key)
@@ -119,13 +113,13 @@ func TestDisabledKeyStopsWorkingImmediatelyOnEveryInstance(t *testing.T) {
 	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
 	t.Cleanup(upstream.Close)
 	cfg := testConfig(upstream.URL)
-	logger := slog.New(slog.DiscardHandler)
+	logger := testLogger(t)
 	first, second := startInstance(t, cfg, logger), startInstance(t, cfg, logger)
 	key, keyID := createKey(t, first, 1_000_000)
 
 	// 两个实例各跑一次，把这个 Key 灌进各自看到的那份缓存
-	require.Equal(t, http.StatusOK, chat(t.Context(), first.business, key))
-	require.Equal(t, http.StatusOK, chat(t.Context(), second.business, key))
+	chatOK(t, first.business, key)
+	chatOK(t, second.business, key)
 
 	adminPost(t, first.admin, fmt.Sprintf("/admin/keys/%d/disable", keyID), ``, nil)
 
@@ -145,9 +139,9 @@ func TestAuthCacheHoldsTheIdentityUntilAdminInvalidatesIt(t *testing.T) {
 	db := testdb.New(t)
 	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
 	t.Cleanup(upstream.Close)
-	gw := startInstance(t, testConfig(upstream.URL), slog.New(slog.DiscardHandler))
+	gw := startInstance(t, testConfig(upstream.URL), testLogger(t))
 	key, keyID := createKey(t, gw, 1_000_000)
-	require.Equal(t, http.StatusOK, chat(t.Context(), gw.business, key)) // 把身份灌进缓存
+	chatOK(t, gw.business, key) // 把身份灌进缓存
 
 	require.NoError(t, db.Exec(`UPDATE api_keys SET disabled = TRUE WHERE id = ?`, keyID).Error)
 
@@ -166,14 +160,14 @@ func TestAuthCacheHoldsTheIdentityUntilAdminInvalidatesIt(t *testing.T) {
 func TestChangingTheQuotaTakesEffectImmediately(t *testing.T) {
 	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
 	t.Cleanup(upstream.Close)
-	gw := startInstance(t, testConfig(upstream.URL), slog.New(slog.DiscardHandler))
+	gw := startInstance(t, testConfig(upstream.URL), testLogger(t))
 	key, keyID := createKey(t, gw, 1_000_000)
-	require.Equal(t, http.StatusOK, chat(t.Context(), gw.business, key)) // 灌缓存，这时额度还是配置里的默认值
+	chatOK(t, gw.business, key) // 灌缓存，这时额度还是配置里的默认值
 
 	adminPost(t, gw.admin, fmt.Sprintf("/admin/keys/%d/limit", keyID), `{"rpm_limit":1}`, nil)
 
 	// 容量一改小，桶里的令牌也被压到新容量，所以只剩一个
-	require.Equal(t, http.StatusOK, chat(t.Context(), gw.business, key))
+	chatOK(t, gw.business, key)
 	status, code := chatOnce(t, gw.business, key)
 	require.Equal(t, http.StatusTooManyRequests, status)
 	require.Equal(t, "rate_limit_exceeded", code) // 缓存没删的话，这里用的还是那个很大的默认额度
@@ -193,28 +187,24 @@ func TestRateLimitAllowsExactlyTheKeyQuota(t *testing.T) {
 	)
 	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
 	t.Cleanup(upstream.Close)
-	gw := startInstance(t, testConfig(upstream.URL), slog.New(slog.DiscardHandler))
+	gw := startInstance(t, testConfig(upstream.URL), testLogger(t))
 	key, keyID := createKey(t, gw, 1_000_000_000) // 余额给够，被拒只可能是限流
 	adminPost(t, gw.admin, fmt.Sprintf("/admin/keys/%d/limit", keyID), fmt.Sprintf(`{"rpm_limit":%d}`, quota), nil)
 
-	var allowed, rejected atomic.Int64
+	var got tally
 	var wg sync.WaitGroup
 	for range requests {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			switch chat(t.Context(), gw.business, key) {
-			case http.StatusOK:
-				allowed.Add(1)
-			case http.StatusTooManyRequests:
-				rejected.Add(1)
-			}
+			got.record(chat(t.Context(), gw.business, key))
 		}()
 	}
 	wg.Wait()
 
-	require.EqualValues(t, quota, allowed.Load())
-	require.EqualValues(t, requests-quota, rejected.Load())
+	require.Empty(t, got.unexpected) // 余额给够了，被拒只可能是限流
+	require.Equal(t, quota, got.ok)
+	require.Equal(t, requests-quota, got.rejected)
 	_, code := chatOnce(t, gw.business, key)
 	require.Equal(t, "rate_limit_exceeded", code) // 是限流拒的，不是余额不够
 }
@@ -227,7 +217,7 @@ func TestGatewayKeepsWorkingWithoutRedis(t *testing.T) {
 	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
 	t.Cleanup(upstream.Close)
 	cfg := testConfig(upstream.URL)
-	logger := slog.New(slog.DiscardHandler)
+	logger := testLogger(t)
 	healthy := startInstance(t, cfg, logger)
 	key, keyID := createKey(t, healthy, credited)
 
@@ -235,7 +225,7 @@ func TestGatewayKeepsWorkingWithoutRedis(t *testing.T) {
 	t.Cleanup(func() { down.Close() })
 	broken := startInstanceWith(t, cfg, down, logger)
 
-	require.Equal(t, http.StatusOK, chat(t.Context(), broken.business, key))
+	chatOK(t, broken.business, key)
 	require.EqualValues(t, credited-costPerRequest, balanceOf(t, db, keyID))
 }
 
@@ -245,7 +235,7 @@ func TestGatewayDoesNotStallOnAnUnresponsiveRedis(t *testing.T) {
 	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
 	t.Cleanup(upstream.Close)
 	cfg := testConfig(upstream.URL)
-	logger := slog.New(slog.DiscardHandler)
+	logger := testLogger(t)
 	key, _ := createKey(t, startInstance(t, cfg, logger), 1_000_000)
 
 	silent, err := openRedis("redis://" + blackhole(t))
@@ -254,7 +244,7 @@ func TestGatewayDoesNotStallOnAnUnresponsiveRedis(t *testing.T) {
 	gw := startInstanceWith(t, cfg, silent, logger)
 
 	start := time.Now()
-	require.Equal(t, http.StatusOK, chat(t.Context(), gw.business, key))
+	chatOK(t, gw.business, key)
 	// 一个请求最多碰三次 Redis：读缓存、回填缓存、取令牌。每次都要等满超时。
 	require.Less(t, time.Since(start), time.Second)
 }
@@ -365,22 +355,92 @@ func adminPost(t *testing.T, url, path, body string, out any) {
 	}
 }
 
-// chat 以调用方的身份发一个非流式请求，返回状态码。它跑在并发的 goroutine 里，所以不做断言。
-func chat(ctx context.Context, url, key string) int {
+// testLogger 把网关自己的日志接到 t.Log：go test 只在用例失败时才打印它们。
+//
+// 这些日志是排查的唯一线索。调用方拿到的 500 一律是 "internal server error"——
+// 错误细节不该顺着响应漏出去——所以请求为什么失败，只有网关自己说得出来。
+// 只收 Warn 以上：访问日志是 Info，一个用例上千条，打出来反而盖住了要看的那几行。
+func testLogger(t *testing.T) *slog.Logger {
+	t.Helper()
+	w := &testWriter{t: t}
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+// maxLoggedLines 是一个用例最多打几条网关日志。上千个并发请求栽在同一件事情上时，
+// 日志是一模一样的一大片，全打出来反而盖住了别的线索。
+const maxLoggedLines = 20
+
+// testWriter 把一条日志转成一次 t.Log。
+type testWriter struct {
+	t    *testing.T
+	seen atomic.Int64
+}
+
+func (w *testWriter) Write(p []byte) (int, error) {
+	switch n := w.seen.Add(1); {
+	case n <= maxLoggedLines:
+		w.t.Logf("gateway: %s", bytes.TrimSuffix(p, []byte("\n")))
+	case n == maxLoggedLines+1:
+		w.t.Logf("gateway: (后面的日志省略了)")
+	}
+	return len(p), nil
+}
+
+// tally 数并发请求的结果。成功和被限额拒绝是预期内的两种结局，其余的按
+// "状态码 + 响应体"分组留着：断言失败时要能说出哪里不对劲，而不只是说有多少个不对劲。
+type tally struct {
+	mu         sync.Mutex
+	ok         int
+	rejected   int
+	unexpected map[string]int
+}
+
+func (r *tally) record(status int, answer string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch status {
+	case http.StatusOK:
+		r.ok++
+	case http.StatusTooManyRequests:
+		r.rejected++
+	default:
+		if r.unexpected == nil {
+			r.unexpected = map[string]int{}
+		}
+		r.unexpected[fmt.Sprintf("%d %.200s", status, answer)]++
+	}
+}
+
+// chat 以调用方的身份发一个非流式请求，返回状态码和一句说明。
+//
+// 它跑在并发的 goroutine 里，不能做断言，所以失败的原因只能原样带回去让调用者汇报：
+// 光有一个状态码，出了事只知道"有 195 个请求不对劲"，说不出哪里不对劲。
+// 连请求都没发出去时状态码是 0，说明里是传输层的错误。
+func chat(ctx context.Context, url, key string) (int, string) {
 	body := `{"model":"mock-model","messages":[{"role":"user","content":"a"}]}`
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/v1/chat/completions", strings.NewReader(body))
 	if err != nil {
-		return 0
+		return 0, err.Error()
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+key)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0
+		return 0, err.Error()
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body) // 响应体读完，连接才能复用
-	return resp.StatusCode
+	answer, err := io.ReadAll(resp.Body) // 响应体读完，连接才能复用
+	if err != nil {
+		return resp.StatusCode, err.Error()
+	}
+	return resp.StatusCode, string(answer)
+}
+
+// chatOK 发一个请求并断言它成功。失败时把响应体一起打出来。
+func chatOK(t *testing.T, url, key string) {
+	t.Helper()
+	status, answer := chat(t.Context(), url, key)
+	require.Equal(t, http.StatusOK, status, answer)
 }
 
 // chatOnce 发一个非流式请求，返回状态码和错误响应里的 code，成功时 code 为空。
