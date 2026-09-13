@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/eeee0717/llm-gateway/internal/sse"
@@ -57,4 +58,92 @@ func firstEventLatency(ctx context.Context, c *http.Client, t target, body []byt
 		return 0, errors.New("first event carried no data")
 	}
 	return elapsed, nil
+}
+
+// report 是一轮压测的原始样本，两组下标和 targets 对应。
+type report struct {
+	Targets [2]target
+	Samples [2][]time.Duration
+	Errors  int
+}
+
+// run 打 n 对请求：每一对在两端各打一次。
+//
+// 两端交替着打，而不是先跑完一端再跑另一端。上游的延迟本来就随时间漂移，
+// 分开跑的话两组经历的是不同的时间窗口，差出来的是漂移而不是网关的开销。
+// 每一对内部的先后也轮换，免得固定排在后面的那端总是沾到前一次刚热好的连接。
+//
+// interval 大于 0 时限速：所有 worker 共用一个 ticker，每发一个请求取一次。
+func run(ctx context.Context, c *http.Client, targets [2]target, body []byte, n, workers int, interval time.Duration) (report, error) {
+	var tick <-chan time.Time
+	if interval > 0 {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		tick = t.C
+	}
+	wait := func() error {
+		if tick == nil {
+			return ctx.Err()
+		}
+		select {
+		case <-tick:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	pairs := make(chan int)
+	go func() {
+		defer close(pairs)
+		for i := range n {
+			select {
+			case pairs <- i:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	type outcome struct {
+		side    int
+		elapsed time.Duration
+	}
+	results := make(chan outcome, 2*n)
+	errs := make(chan error, 2*n)
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range pairs {
+				for k := range 2 {
+					side := (i + k) % 2 // 每一对轮换先后
+					if err := wait(); err != nil {
+						return
+					}
+					elapsed, err := firstEventLatency(ctx, c, targets[side], body)
+					if err != nil {
+						errs <- fmt.Errorf("%s: %w", targets[side].Name, err)
+						return
+					}
+					results <- outcome{side, elapsed}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	rep := report{Targets: targets}
+	for r := range results {
+		rep.Samples[r.side] = append(rep.Samples[r.side], r.elapsed)
+	}
+	rep.Errors = len(errs)
+	if err := <-errs; err != nil {
+		return rep, fmt.Errorf("%d of %d requests failed, first one: %w", rep.Errors, 2*n, err)
+	}
+	return rep, nil
 }
