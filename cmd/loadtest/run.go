@@ -28,14 +28,20 @@ func (t target) keyFor(i int) string {
 	return t.Keys[i%len(t.Keys)]
 }
 
-// firstEventLatency 打一次流式请求，返回从发出请求到收到第一个 SSE 事件的时间。
+// timing 是一次请求的两个时间点。
+type timing struct {
+	first time.Duration // 第一个 SSE 事件到达；延迟对照看这个
+	total time.Duration // 整个流读完；吞吐看这个
+}
+
+// request 打一次流式请求，读完整个流。
 //
-// 计时到"第一个事件"为止，而不是整段读完：网关的开销全部发生在转发的路上，
+// 延迟对照只取到"第一个事件"为止：网关的开销全部发生在转发的路上，
 // 之后的事件只是沿着同一条已经建好的流走，把它们算进来只会稀释要看的那个数。
-func firstEventLatency(ctx context.Context, c *http.Client, url, key string, body []byte) (time.Duration, error) {
+func request(ctx context.Context, c *http.Client, url, key string, body []byte) (timing, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return timing{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if key != "" {
@@ -45,27 +51,77 @@ func firstEventLatency(ctx context.Context, c *http.Client, url, key string, bod
 	start := time.Now()
 	resp, err := c.Do(req)
 	if err != nil {
-		return 0, err
+		return timing{}, err
 	}
 	// 读完剩下的流再关，连接才回得了连接池；半路 Close 会让下一次请求重新握手，
 	// 测出来的就成了建连时间。
-	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-	}()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("upstream returned %d", resp.StatusCode)
+		return timing{}, fmt.Errorf("upstream returned %d", resp.StatusCode)
 	}
 	event, err := sse.NewReader(resp.Body).Next()
 	if err != nil {
-		return 0, fmt.Errorf("read first event: %w", err)
+		return timing{}, fmt.Errorf("read first event: %w", err)
 	}
-	elapsed := time.Since(start)
+	got := timing{first: time.Since(start)}
 	if len(event.Data) == 0 {
-		return 0, errors.New("first event carried no data")
+		return timing{}, errors.New("first event carried no data")
 	}
-	return elapsed, nil
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return timing{}, fmt.Errorf("read the rest of the stream: %w", err)
+	}
+	got.total = time.Since(start)
+	return got, nil
+}
+
+// saturate 用固定的并发连着打一端，直到时间用完，返回每个请求从头到尾的耗时。
+//
+// 吞吐不像延迟对照那样两端交替：交替的意义是抵消上游随时间的漂移，而吞吐只对
+// mock 上游有意义（真实上游的速率限制会先一步成为瓶颈），mock 的行为不随时间变。
+// 两端分开跑才能各自打满并发。
+//
+// 每个 worker 固定用一个 Key。Key 比 worker 少时才会出现同一行上的预扣排队，
+// 那时量的就不是网关的处理能力，而是行锁。
+func saturate(ctx context.Context, c *http.Client, t target, body []byte, workers int, d time.Duration) ([]time.Duration, error) {
+	ctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+
+	var mu sync.Mutex
+	var all []time.Duration
+	var failed error
+
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var mine []time.Duration
+			defer func() {
+				mu.Lock()
+				all = append(all, mine...)
+				mu.Unlock()
+			}()
+			for ctx.Err() == nil {
+				got, err := request(ctx, c, t.URL, t.keyFor(w), body)
+				if err != nil {
+					// 时间到了，正在路上的请求被取消——那是收尾，不是故障。
+					if ctx.Err() != nil {
+						return
+					}
+					mu.Lock()
+					if failed == nil {
+						failed = fmt.Errorf("%s: %w", t.Name, err)
+					}
+					mu.Unlock()
+					return
+				}
+				mine = append(mine, got.total)
+			}
+		}()
+	}
+	wg.Wait()
+	return all, failed
 }
 
 // report 是一轮压测的原始样本，两组下标和 targets 对应。
@@ -135,12 +191,12 @@ func measure(ctx context.Context, c *http.Client, targets [2]target, body []byte
 					if err := wait(); err != nil {
 						return
 					}
-					elapsed, err := firstEventLatency(ctx, c, targets[side].URL, targets[side].keyFor(i), body)
+					got, err := request(ctx, c, targets[side].URL, targets[side].keyFor(i), body)
 					if err != nil {
 						errs <- fmt.Errorf("%s: %w", targets[side].Name, err)
 						return
 					}
-					results <- outcome{side, elapsed}
+					results <- outcome{side, got.first}
 				}
 			}
 		}()

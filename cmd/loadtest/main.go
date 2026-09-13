@@ -44,6 +44,8 @@ func run(args []string, out io.Writer) error {
 		workers    = fs.Int("c", 10, "并发")
 		interval   = fs.Duration("interval", 0, "两个请求之间的最小间隔，用来迁就上游的速率限制")
 		extra      = fs.String("extra", "", `并进请求体的额外字段，JSON 对象，例如 '{"max_tokens":1}'`)
+		mode       = fs.String("mode", "latency", "latency 比首 token 延迟，throughput 比打满并发后的吞吐")
+		duration   = fs.Duration("duration", 30*time.Second, "throughput 模式下每端各打多久")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -53,6 +55,9 @@ func run(args []string, out io.Writer) error {
 	}
 	if *n < 1 || *workers < 1 {
 		return errors.New("-n 和 -c 都要大于 0")
+	}
+	if *mode != "latency" && *mode != "throughput" {
+		return fmt.Errorf("-mode 只能是 latency 或 throughput，收到 %q", *mode)
 	}
 
 	body, err := requestBody(*model, *extra)
@@ -67,8 +72,13 @@ func run(args []string, out io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	client := newClient(*workers)
+	if *mode == "throughput" {
+		return throughput(ctx, out, client, targets, body, *workers, *duration)
+	}
+
 	started := time.Now()
-	rep, err := measure(ctx, newClient(*workers), targets, body, *n, *workers, *interval)
+	rep, err := measure(ctx, client, targets, body, *n, *workers, *interval)
 	if err != nil {
 		return err
 	}
@@ -90,6 +100,34 @@ func requestBody(model, extra string) ([]byte, error) {
 	body["stream"] = true
 	body["messages"] = []map[string]string{{"role": "user", "content": "hi"}}
 	return json.Marshal(body)
+}
+
+// throughput 两端各打满一段时间，报每秒完成多少个完整请求。
+func throughput(ctx context.Context, out io.Writer, c *http.Client, targets [2]target, body []byte, workers int, d time.Duration) error {
+	var samples [2][]time.Duration
+	var qps [2]float64
+	for i, t := range targets {
+		started := time.Now()
+		got, err := saturate(ctx, c, t, body, workers, d)
+		if err != nil {
+			return err
+		}
+		if len(got) == 0 {
+			return fmt.Errorf("%s: 一个请求都没跑完，把 -duration 调大些", t.Name)
+		}
+		samples[i], qps[i] = got, float64(len(got))/time.Since(started).Seconds()
+	}
+
+	fmt.Fprintf(out, "workers=%d duration=%s 每端分别打满\n\n", workers, d)
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', tabwriter.AlignRight)
+	fmt.Fprintln(w, "\tdone\tQPS\tp50\tp99\t")
+	for i, t := range targets {
+		s := summarize(samples[i])
+		fmt.Fprintf(w, "%s\t%d\t%.1f\t%s\t%s\t\n", t.Name, s.N, qps[i], ms(s.P50), ms(s.P99))
+	}
+	fmt.Fprintf(w, "%s 的吞吐是 %s 的\t\t%.0f%%\t\t\t\n",
+		targets[1].Name, targets[0].Name, 100*qps[1]/qps[0])
+	return w.Flush()
 }
 
 // keys 把逗号分隔的密钥拆开，顺带丢掉空的。

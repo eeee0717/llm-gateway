@@ -24,11 +24,12 @@ func TestMeasuresTimeToFirstEventNotTheWholeStream(t *testing.T) {
 	}))
 	defer up.Close()
 
-	got, err := firstEventLatency(t.Context(), http.DefaultClient, up.URL+"/v1", "", probe)
+	got, err := request(t.Context(), http.DefaultClient, up.URL+"/v1", "", probe)
 
 	require.NoError(t, err)
-	require.GreaterOrEqual(t, got, 200*time.Millisecond)
-	require.Less(t, got, 500*time.Millisecond)
+	require.GreaterOrEqual(t, got.first, 200*time.Millisecond)
+	require.Less(t, got.first, 500*time.Millisecond)
+	require.Greater(t, got.total, got.first) // 整段比首个事件晚
 }
 
 // 失败的请求返回得比成功的快得多，混进样本里会把分位数拉得很好看。
@@ -36,7 +37,7 @@ func TestFailedRequestIsAnErrorNotASample(t *testing.T) {
 	up := httptest.NewServer(mockupstream.New(mockupstream.Options{FailStatus: http.StatusInternalServerError}))
 	defer up.Close()
 
-	_, err := firstEventLatency(t.Context(), http.DefaultClient, up.URL+"/v1", "", probe)
+	_, err := request(t.Context(), http.DefaultClient, up.URL+"/v1", "", probe)
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "500")
@@ -124,4 +125,28 @@ func TestKeysAreUsedInTurn(t *testing.T) {
 	require.Equal(t, 2, seen["Bearer k2"])
 	require.Equal(t, 2, seen["Bearer k3"])
 	require.Equal(t, 6, seen[""]) // direct 那端不带 Authorization
+}
+
+// 吞吐是打满并发之后每秒完成多少个完整请求。上游每个请求 100ms，
+// 10 个 worker 各自连着打 1 秒，完成数应当在 10/0.1=100 上下。
+func TestThroughputSaturatesTheGivenConcurrency(t *testing.T) {
+	up := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 1, FirstDelay: 100 * time.Millisecond}))
+	defer up.Close()
+
+	got, err := saturate(t.Context(), http.DefaultClient, target{URL: up.URL + "/v1"}, probe, 10, time.Second)
+
+	require.NoError(t, err)
+	require.Greater(t, len(got), 50)
+	require.Less(t, len(got), 150)
+}
+
+// 时间到了之后正在路上的请求会被取消，那不是错误，不该报出来。
+func TestThroughputEndingIsNotAnError(t *testing.T) {
+	up := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 1, FirstDelay: 300 * time.Millisecond}))
+	defer up.Close()
+
+	got, err := saturate(t.Context(), http.DefaultClient, target{URL: up.URL + "/v1"}, probe, 4, 400*time.Millisecond)
+
+	require.NoError(t, err)
+	require.NotEmpty(t, got)
 }
