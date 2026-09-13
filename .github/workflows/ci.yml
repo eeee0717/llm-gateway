@@ -32,7 +32,7 @@ jobs:
           --health-interval 2s --health-timeout 3s --health-retries 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # 工具链版本只在 mise.toml 里写一次，CI 和本地装的是同一个。
       - uses: jdx/mise-action@v2
@@ -51,5 +51,5 @@ jobs:
   image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: docker build -t llm-gateway:ci .
