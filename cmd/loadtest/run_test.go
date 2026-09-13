@@ -3,6 +3,8 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -72,4 +74,25 @@ func TestRunStopsAtTheFirstErrorInsteadOfReportingNonsense(t *testing.T) {
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "502")
+}
+
+// 收口：中间那一层加进去多少延迟，压测就该报出多少。
+// 用一个固定睡 60ms 再转发的反向代理冒充网关，两端打的是同一个上游。
+func TestReportsTheLatencyTheMiddleLayerAdds(t *testing.T) {
+	up := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3, FirstDelay: 100 * time.Millisecond}))
+	defer up.Close()
+	upURL, err := url.Parse(up.URL)
+	require.NoError(t, err)
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(60 * time.Millisecond)
+		httputil.NewSingleHostReverseProxy(upURL).ServeHTTP(w, r)
+	}))
+	defer slow.Close()
+	both := [2]target{{Name: "direct", URL: up.URL + "/v1"}, {Name: "gateway", URL: slow.URL + "/v1"}}
+
+	got, err := measure(t.Context(), http.DefaultClient, both, probe, 30, 3, 0)
+
+	require.NoError(t, err)
+	extra := summarize(got.Samples[1]).P50 - summarize(got.Samples[0]).P50
+	require.InDelta(t, float64(60*time.Millisecond), float64(extra), float64(30*time.Millisecond))
 }
