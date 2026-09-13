@@ -34,6 +34,9 @@ func summarize(samples []time.Duration) summary {
 // percentile 用最近秩法取分位数：排序后的第 ceil(n × p/100) 个样本。
 // 不在相邻两个样本之间插值，报出来的数字就一定是真测到过的一次请求。
 func percentile(sorted []time.Duration, p int) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
 	rank := (len(sorted)*p + 99) / 100
-	return sorted[max(rank, 1)-1]
+	return sorted[min(max(rank, 1), len(sorted))-1]
 }

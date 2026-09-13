@@ -54,8 +54,11 @@ func request(ctx context.Context, c *http.Client, url, key string, body []byte) 
 		return timing{}, err
 	}
 	// 读完剩下的流再关，连接才回得了连接池；半路 Close 会让下一次请求重新握手，
-	// 测出来的就成了建连时间。
-	defer func() { _ = resp.Body.Close() }()
+	// 测出来的就成了建连时间。出错的那条路也一样，所以放在 defer 里。
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return timing{}, fmt.Errorf("upstream returned %d", resp.StatusCode)
@@ -84,7 +87,8 @@ func request(ctx context.Context, c *http.Client, url, key string, body []byte) 
 // 每个 worker 固定用一个 Key。Key 比 worker 少时才会出现同一行上的预扣排队，
 // 那时量的就不是网关的处理能力，而是行锁。
 func saturate(ctx context.Context, c *http.Client, t target, body []byte, workers int, d time.Duration) ([]time.Duration, error) {
-	ctx, cancel := context.WithTimeout(ctx, d)
+	// deadline 到期是正常收尾；ctx 被取消（Ctrl-C）是半途而废，两者不能混为一谈。
+	deadline, cancel := context.WithTimeout(ctx, d)
 	defer cancel()
 
 	var mu sync.Mutex
@@ -102,11 +106,11 @@ func saturate(ctx context.Context, c *http.Client, t target, body []byte, worker
 				all = append(all, mine...)
 				mu.Unlock()
 			}()
-			for ctx.Err() == nil {
-				got, err := request(ctx, c, t.URL, t.keyFor(w), body)
+			for deadline.Err() == nil {
+				got, err := request(deadline, c, t.URL, t.keyFor(w), body)
 				if err != nil {
 					// 时间到了，正在路上的请求被取消——那是收尾，不是故障。
-					if ctx.Err() != nil {
+					if deadline.Err() != nil {
 						return
 					}
 					mu.Lock()
@@ -121,7 +125,13 @@ func saturate(ctx context.Context, c *http.Client, t target, body []byte, worker
 		}()
 	}
 	wg.Wait()
-	return all, failed
+	if failed != nil {
+		return all, failed
+	}
+	if ctx.Err() != nil {
+		return all, fmt.Errorf("%s: interrupted after %d requests", t.Name, len(all))
+	}
+	return all, nil
 }
 
 // report 是一轮压测的原始样本，两组下标和 targets 对应。

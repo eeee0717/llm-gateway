@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -149,4 +150,18 @@ func TestThroughputEndingIsNotAnError(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotEmpty(t, got)
+}
+
+// Ctrl-C 打断的那一轮不能当成正常结果报出去：样本只跑了一部分，
+// 而报告长得和跑完的一模一样。
+func TestThroughputInterruptedIsAnError(t *testing.T) {
+	up := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 1, FirstDelay: 20 * time.Millisecond}))
+	defer up.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() { time.Sleep(200 * time.Millisecond); cancel() }()
+
+	_, err := saturate(ctx, http.DefaultClient, target{URL: up.URL + "/v1"}, probe, 2, time.Minute)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "interrupted")
 }

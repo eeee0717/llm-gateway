@@ -1,9 +1,15 @@
-// loadtest 测经过网关比直连上游多出多少首 token 延迟。
+// loadtest 比较直连上游和经过网关这两端，两端打的是同样的流式请求。
 //
-// 两端各打同样的流式请求，交替进行，报告两条延迟分布和它们的差。
+// 两个模式量的是两件事：
+//
+//	latency     每端交替打 -n 对请求，比第一个 SSE 事件到达的时间
+//	throughput  每端各打满 -duration 的时长，比每秒完成多少个完整请求
 //
 //	loadtest -direct http://localhost:9090/v1 -gateway http://localhost:8080/v1 \
 //	         -gateway-key sk-... -model mock-model -n 500 -c 20
+//
+//	loadtest -mode throughput -direct ... -gateway ... -gateway-key k1,k2,k3 \
+//	         -model mock-model -c 50 -duration 20s
 package main
 
 import (
@@ -51,13 +57,29 @@ func run(args []string, out io.Writer) error {
 		return err
 	}
 	if *direct == "" || *model == "" {
-		return errors.New("-direct 和 -model 是必填的")
+		return errors.New("-direct and -model are required")
 	}
 	if *n < 1 || *workers < 1 {
-		return errors.New("-n 和 -c 都要大于 0")
+		return errors.New("-n and -c must be greater than 0")
 	}
-	if *mode != "latency" && *mode != "throughput" {
-		return fmt.Errorf("-mode 只能是 latency 或 throughput，收到 %q", *mode)
+	// 两个模式各认各的参数。默默忽略一个传进来的参数很危险：以为 -interval
+	// 限住了速率才敢去打真实上游，而吞吐模式根本不看它。
+	given := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
+	switch *mode {
+	case "latency":
+		if given["duration"] {
+			return errors.New("-duration only applies to -mode throughput; latency mode runs -n pairs")
+		}
+	case "throughput":
+		if given["interval"] {
+			return errors.New("-mode throughput ignores -interval by design, it saturates; use latency mode to rate-limit")
+		}
+		if given["n"] {
+			return errors.New("-mode throughput runs for -duration, not a fixed -n")
+		}
+	default:
+		return fmt.Errorf("-mode must be latency or throughput, got %q", *mode)
 	}
 
 	body, err := requestBody(*model, *extra)
@@ -93,7 +115,7 @@ func requestBody(model, extra string) ([]byte, error) {
 	body := map[string]any{}
 	if extra != "" {
 		if err := json.Unmarshal([]byte(extra), &body); err != nil {
-			return nil, fmt.Errorf("-extra 不是合法的 JSON 对象: %w", err)
+			return nil, fmt.Errorf("-extra is not a valid JSON object: %w", err)
 		}
 	}
 	body["model"] = model
@@ -113,12 +135,12 @@ func throughput(ctx context.Context, out io.Writer, c *http.Client, targets [2]t
 			return err
 		}
 		if len(got) == 0 {
-			return fmt.Errorf("%s: 一个请求都没跑完，把 -duration 调大些", t.Name)
+			return fmt.Errorf("%s: no request finished, raise -duration", t.Name)
 		}
 		samples[i], qps[i] = got, float64(len(got))/time.Since(started).Seconds()
 	}
 
-	fmt.Fprintf(out, "workers=%d duration=%s 每端分别打满\n\n", workers, d)
+	fmt.Fprintf(out, "workers=%d duration=%s 每端分别打满；p50/p99 是整个请求读完的耗时，不是首 token 延迟\n\n", workers, d)
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', tabwriter.AlignRight)
 	fmt.Fprintln(w, "\tdone\tQPS\tp50\tp99\t")
 	for i, t := range targets {

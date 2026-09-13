@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -29,4 +30,27 @@ func TestExtraIsOptional(t *testing.T) {
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(got, &body))
 	require.Equal(t, true, body["stream"])
+}
+
+// 每个模式只认自己那几个参数。传了不管用的参数要当场报错，
+// 不能默默忽略——尤其是 -interval：以为限速生效了才敢打真实上游。
+func TestRejectsFlagsThatTheModeIgnores(t *testing.T) {
+	base := []string{"-direct", "http://x/v1", "-model", "m"}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"吞吐模式不限速", []string{"-mode", "throughput", "-interval", "3s"}, "-interval"},
+		{"吞吐模式按时间不按次数", []string{"-mode", "throughput", "-n", "500"}, "-n"},
+		{"延迟模式不看时长", []string{"-duration", "10s"}, "-duration"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := run(append(base, tc.args...), io.Discard)
+
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.want)
+		})
+	}
 }
