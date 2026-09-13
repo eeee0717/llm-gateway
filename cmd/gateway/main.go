@@ -114,6 +114,12 @@ func openRedis(url string) (*redis.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("redis url: %w", err)
 	}
+	// 放行的前提是"很快知道 Redis 不行了"。按默认值，一个连不上但没被拒绝的 Redis
+	// （比如网络黑洞）会让每个请求先等 5 秒、还重试 3 次，网关比没有缓存时慢得多。
+	opts.DialTimeout = 100 * time.Millisecond
+	opts.ReadTimeout = 100 * time.Millisecond
+	opts.WriteTimeout = 100 * time.Millisecond
+	opts.MaxRetries = -1 // go-redis 里 -1 是"不重试"，0 才是默认的重试 3 次
 	return redis.NewClient(opts), nil
 }
 

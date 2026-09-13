@@ -12,7 +12,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 
@@ -175,6 +177,26 @@ func TestRateLimitAllowsExactlyTheKeyQuota(t *testing.T) {
 	require.Equal(t, "rate_limit_exceeded", code) // 是限流拒的，不是余额不够
 }
 
+// Redis 连不上时网关照常工作：鉴权直接查数据库，限流放行，计费一点不受影响——
+// 余额只在 PostgreSQL，Redis 里的东西丢了都能重建，见 docs/adr/0002。
+func TestGatewayKeepsWorkingWithoutRedis(t *testing.T) {
+	const credited = 1_000_000
+	db := testdb.New(t)
+	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
+	t.Cleanup(upstream.Close)
+	cfg := testConfig(upstream.URL)
+	logger := slog.New(slog.DiscardHandler)
+	healthy := startInstance(t, cfg, logger)
+	key, keyID := createKey(t, healthy, credited)
+
+	down := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 50 * time.Millisecond})
+	t.Cleanup(func() { down.Close() })
+	broken := startInstanceWith(t, cfg, down, logger)
+
+	require.Equal(t, http.StatusOK, chat(t.Context(), broken.business, key))
+	require.EqualValues(t, credited-costPerRequest, balanceOf(t, db, keyID))
+}
+
 // instance 是一个网关实例的两个端口。
 type instance struct {
 	business string
@@ -184,9 +206,14 @@ type instance struct {
 // startInstance 起一个网关实例。每个实例自己开一套数据库连接，和真正跑两个进程一样。
 func startInstance(t *testing.T, cfg *config.Config, logger *slog.Logger) instance {
 	t.Helper()
+	return startInstanceWith(t, cfg, testredis.New(t), logger)
+}
+
+func startInstanceWith(t *testing.T, cfg *config.Config, rdb *redis.Client, logger *slog.Logger) instance {
+	t.Helper()
 	db, err := openDB(testdb.DSN())
 	require.NoError(t, err)
-	business, management := build(cfg, db, testredis.New(t), logger)
+	business, management := build(cfg, db, rdb, logger)
 	b := httptest.NewServer(business)
 	t.Cleanup(b.Close)
 	m := httptest.NewServer(management)
