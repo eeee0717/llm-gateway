@@ -19,6 +19,7 @@ import (
 	"github.com/eeee0717/llm-gateway/internal/config"
 	"github.com/eeee0717/llm-gateway/internal/mockupstream"
 	"github.com/eeee0717/llm-gateway/internal/testdb"
+	"github.com/eeee0717/llm-gateway/internal/testredis"
 )
 
 const adminKey = "admin-secret"
@@ -118,7 +119,7 @@ func startInstance(t *testing.T, cfg *config.Config, logger *slog.Logger) instan
 	t.Helper()
 	db, err := openDB(testdb.DSN())
 	require.NoError(t, err)
-	business, management := build(cfg, db, logger)
+	business, management := build(cfg, db, testredis.New(t), logger)
 	b := httptest.NewServer(business)
 	t.Cleanup(b.Close)
 	m := httptest.NewServer(management)

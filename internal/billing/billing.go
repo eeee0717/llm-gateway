@@ -62,10 +62,11 @@ func New(db *gorm.DB, prices map[string]Price) *Service {
 
 // Reserve 按输出上限算出最大可能的费用并预扣。
 func (s *Service) Reserve(ctx context.Context, r Reservation) (int64, bool, error) {
-	keyID, ok := apikey.From(ctx)
+	identity, ok := apikey.From(ctx)
 	if !ok {
 		return 0, false, errors.New("no api key in context")
 	}
+	keyID := identity.ID
 	amount := s.cost(r.Model, openai.Usage{PromptTokens: r.PromptTokens, CompletionTokens: r.MaxOutputTokens})
 	ok, err := s.store.reserve(ctx, keyID, amount)
 	if err != nil {
@@ -77,10 +78,11 @@ func (s *Service) Reserve(ctx context.Context, r Reservation) (int64, bool, erro
 // Settle 按实际用量结算：预扣和实际费用的差额退回余额，同时写一条用量记录。
 // 错误里带上 API Key 的 ID：结算失败时那笔预扣还挂在余额上，对账要找的就是这个 Key。
 func (s *Service) Settle(ctx context.Context, r Result) error {
-	keyID, ok := apikey.From(ctx)
+	identity, ok := apikey.From(ctx)
 	if !ok {
 		return errors.New("no api key in context")
 	}
+	keyID := identity.ID
 	// 请求 ID 是结算的幂等键，空的话所有请求会撞在同一个主键上，只有第一个能结算，其余的预扣都退不回来
 	if r.RequestID == "" {
 		return fmt.Errorf("settle for api key %d: request id is empty", keyID)

@@ -134,7 +134,7 @@ func serve(args []string) error {
 	defer rdb.Close()
 	pingRedis(rdb, logger)
 
-	business, management := build(cfg, db, logger)
+	business, management := build(cfg, db, rdb, logger)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return server.Run(ctx, logger,
@@ -156,11 +156,12 @@ func pingRedis(rdb *redis.Client, logger *slog.Logger) {
 }
 
 // build 组装两个端口的处理器。所有依赖都在这里接起来，测试也用它，测的就是真正跑起来的那套装配。
-func build(cfg *config.Config, db *gorm.DB, logger *slog.Logger) (business, management http.Handler) {
+func build(cfg *config.Config, db *gorm.DB, rdb *redis.Client, logger *slog.Logger) (business, management http.Handler) {
 	keys := apikey.NewStore(db)
+	cache := apikey.NewCache(rdb, keys, logger)
 	rh := relay.New(cfg, biller{billing.New(db, prices(cfg))}, logger)
 	ah := admin.New(logger, keys)
-	return server.New(logger, rh, apikey.Middleware(logger, keys)),
+	return server.New(logger, rh, apikey.Middleware(logger, cache)),
 		server.NewAdmin(logger, ah, admin.Auth(cfg.Admin.Key))
 }
 

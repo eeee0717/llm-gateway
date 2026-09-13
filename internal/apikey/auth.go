@@ -14,27 +14,33 @@ import (
 
 type ctxKey struct{}
 
-// NewContext 把 Key 的 ID 放进 context。日志和计费只认 ID，不碰明文。
-func NewContext(ctx context.Context, id int64) context.Context {
-	return context.WithValue(ctx, ctxKey{}, id)
+// NewContext 把鉴权的结果放进 context。后面的限流和计费从这里取，不碰 Key 的明文。
+func NewContext(ctx context.Context, identity Identity) context.Context {
+	return context.WithValue(ctx, ctxKey{}, identity)
 }
 
-// From 取出当前请求的 Key ID。没有经过鉴权时返回 false。
-func From(ctx context.Context) (int64, bool) {
-	id, ok := ctx.Value(ctxKey{}).(int64)
-	return id, ok
+// From 取出当前请求的鉴权结果。没有经过鉴权时返回 false。
+func From(ctx context.Context) (Identity, bool) {
+	identity, ok := ctx.Value(ctxKey{}).(Identity)
+	return identity, ok
 }
 
-// Middleware 校验 API Key：从 Authorization 头取出明文，按 SHA-256 查库，通过后把 Key 的 ID 放进 context。
-// Key 不存在和被禁用分开报错，方便调用方知道是该换 Key 还是该找管理员。
-func Middleware(logger *slog.Logger, store *Store) gin.HandlerFunc {
+// Lookup 按 Key 的哈希查出鉴权要用的信息。Store 和它的缓存 Cache 都实现了这个接口，
+// 装不装缓存由 cmd/gateway 决定。
+type Lookup interface {
+	IdentityByHash(ctx context.Context, hash string) (Identity, error)
+}
+
+// Middleware 校验 API Key：从 Authorization 头取出明文，按 SHA-256 查出对应的 Key，
+// 通过后把鉴权结果放进 context。Key 不存在和被禁用分开报错，方便调用方知道是该换 Key 还是该找管理员。
+func Middleware(logger *slog.Logger, keys Lookup) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		plain, ok := strings.CutPrefix(c.GetHeader("Authorization"), "Bearer ")
 		if !ok || plain == "" {
 			unauthorized(c, "invalid_api_key", "missing API key")
 			return
 		}
-		key, err := store.ByHash(c.Request.Context(), Hash(plain))
+		identity, err := keys.IdentityByHash(c.Request.Context(), Hash(plain))
 		switch {
 		case errors.Is(err, ErrNotFound):
 			unauthorized(c, "invalid_api_key", "invalid API key")
@@ -44,11 +50,11 @@ func Middleware(logger *slog.Logger, store *Store) gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusInternalServerError,
 				openai.NewError(openai.TypeServer, "internal_error", "internal server error"))
 			return
-		case key.Disabled:
+		case identity.Disabled:
 			unauthorized(c, "key_disabled", "API key is disabled")
 			return
 		}
-		c.Request = c.Request.WithContext(NewContext(c.Request.Context(), key.ID))
+		c.Request = c.Request.WithContext(NewContext(c.Request.Context(), identity))
 		c.Next()
 	}
 }

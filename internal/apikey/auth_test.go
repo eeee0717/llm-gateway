@@ -69,9 +69,9 @@ func startAuthed(t *testing.T, store *apikey.Store) string {
 	r := gin.New()
 	r.Use(apikey.Middleware(slog.New(slog.DiscardHandler), store))
 	r.GET("/", func(c *gin.Context) {
-		id, ok := apikey.From(c.Request.Context())
+		identity, ok := apikey.From(c.Request.Context())
 		require.True(t, ok)
-		c.JSON(http.StatusOK, gin.H{"key_id": id})
+		c.JSON(http.StatusOK, gin.H{"key_id": identity.ID})
 	})
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)

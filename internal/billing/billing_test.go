@@ -159,7 +159,7 @@ func BenchmarkReserveAndSettle(b *testing.B) {
 	key, err := apikey.NewStore(db).Create(b.Context(), "benchmark", hash, 0)
 	require.NoError(b, err)
 	require.NoError(b, db.Exec(`UPDATE api_keys SET balance_micro = ? WHERE id = ?`, int64(1)<<40, key.ID).Error)
-	ctx := apikey.NewContext(b.Context(), key.ID)
+	ctx := apikey.NewContext(b.Context(), apikey.Identity{ID: key.ID})
 
 	b.Run("reserve", func(b *testing.B) {
 		for b.Loop() {
@@ -196,7 +196,7 @@ func keyWithBalance(t *testing.T, db *gorm.DB, balance int64) (context.Context, 
 	key, err := apikey.NewStore(db).Create(t.Context(), "test key", hash, 0)
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(`UPDATE api_keys SET balance_micro = ? WHERE id = ?`, balance, key.ID).Error)
-	return apikey.NewContext(t.Context(), key.ID), key.ID
+	return apikey.NewContext(t.Context(), apikey.Identity{ID: key.ID}), key.ID
 }
 
 // balanceOf 查一个 Key 的余额。查不到行时 Scan 不报错、balance 留在零值，所以这里要看行数：

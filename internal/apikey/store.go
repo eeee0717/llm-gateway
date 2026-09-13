@@ -46,6 +46,20 @@ func (s *Store) ByHash(ctx context.Context, hash string) (Key, error) {
 	return s.find(ctx, "key_hash = ?", hash)
 }
 
+// IdentityByHash 只查鉴权要用的字段：身份和限流额度，不取余额。鉴权缓存回源走的是这条。
+func (s *Store) IdentityByHash(ctx context.Context, hash string) (Identity, error) {
+	var identity Identity
+	res := s.db.WithContext(ctx).Raw(
+		`SELECT id, disabled, rpm_limit AS rpm FROM api_keys WHERE key_hash = ?`, hash).Scan(&identity)
+	switch {
+	case res.Error != nil:
+		return Identity{}, res.Error
+	case res.RowsAffected == 0:
+		return Identity{}, ErrNotFound
+	}
+	return identity, nil
+}
+
 // ByID 按 ID 查记录，管理接口用。
 func (s *Store) ByID(ctx context.Context, id int64) (Key, error) {
 	return s.find(ctx, "id = ?", id)

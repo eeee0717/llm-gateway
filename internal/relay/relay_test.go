@@ -610,7 +610,7 @@ func startGateway(t *testing.T, models map[string]http.Handler) *gateway {
 // stubAuth 顶替鉴权中间件：relay 的测试不连数据库，只要 context 里有一个 Key ID 就行。
 func stubAuth(requests chan<- context.Context) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ctx := apikey.NewContext(c.Request.Context(), 1)
+		ctx := apikey.NewContext(c.Request.Context(), apikey.Identity{ID: 1})
 		c.Request = c.Request.WithContext(ctx)
 		requests <- ctx
 		c.Next()
