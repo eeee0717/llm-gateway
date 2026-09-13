@@ -83,12 +83,7 @@ func TestTokensRefillOverTime(t *testing.T) {
 // 否则超前的实例下一次调用会重新算出一大段"经过的时间"，把桶补满，而且每次交替都补一次，
 // 限流就形同虚设。
 func TestALaggingClockDoesNotRefillTheBucket(t *testing.T) {
-	rdb := testredis.New(t)
-	logger := slog.New(slog.DiscardHandler)
-	ahead := &clock{now: time.Now()}
-	behind := &clock{now: ahead.now.Add(-time.Minute)}
-	fast := ratelimit.New(rdb, ahead.Now, logger)
-	slow := ratelimit.New(rdb, behind.Now, logger)
+	fast, slow := twoClocks(t)
 	keyID := rand.Int64()
 	drain(t, fast, keyID)
 
@@ -102,6 +97,19 @@ func TestALaggingClockDoesNotRefillTheBucket(t *testing.T) {
 		}
 	}
 	require.Zero(t, allowed) // 时间没往前走过，一个令牌也不该补回来
+}
+
+// 时钟往回跳也不会把桶抽干：经过的时间取不小于零的那部分，否则"负的经过时间"
+// 会算出负的补充量，把桶里剩下的令牌抹掉。
+func TestALaggingClockDoesNotDrainTheBucket(t *testing.T) {
+	fast, slow := twoClocks(t)
+	keyID := rand.Int64()
+	ok, _ := fast.Allow(t.Context(), keyID, rpm) // 建出桶，用掉一个令牌
+	require.True(t, ok)
+
+	ok, _ = slow.Allow(t.Context(), keyID, rpm)
+
+	require.True(t, ok) // 桶里还有 59 个
 }
 
 // 补充不会超过桶的容量：停一整天回来，也只有一分钟的量。
@@ -155,6 +163,15 @@ func TestAllowsWhenRedisIsDown(t *testing.T) {
 
 	require.True(t, ok)
 	require.Zero(t, retryAfter)
+}
+
+// twoClocks 起两个共用一套 Redis 的 Limiter，它们的时钟相差一分钟，用来模拟实例之间的时钟漂移。
+func twoClocks(t *testing.T) (fast, slow *ratelimit.Limiter) {
+	t.Helper()
+	rdb, logger := testredis.New(t), slog.New(slog.DiscardHandler)
+	now := time.Now()
+	return ratelimit.New(rdb, (&clock{now: now}).Now, logger),
+		ratelimit.New(rdb, (&clock{now: now.Add(-time.Minute)}).Now, logger)
 }
 
 func newLimiter(t *testing.T) (*ratelimit.Limiter, *clock) {

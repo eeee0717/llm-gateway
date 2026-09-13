@@ -61,7 +61,8 @@ func (h *Handler) CreateKey(c *gin.Context) {
 		h.internalError(c, "create api key", err)
 		return
 	}
-	// 建之前可能有人拿这个哈希查过，缓存里记着"不存在"，清掉它
+	// 建之前可能有人拿这个哈希查过，缓存里记着"不存在"。哈希是 256 位随机数，
+	// 实际上撞不上，这一步是防御性的
 	h.cache.Forget(c.Request.Context(), key.KeyHash)
 	c.JSON(http.StatusCreated, view(key, plain))
 }

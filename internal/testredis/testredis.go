@@ -21,7 +21,8 @@ var (
 )
 
 // New 返回整个测试二进制共用的 Redis 客户端。
-// 测试之间不清库：每个测试自己的键都带随机前缀，所以可以并行。
+// 测试之间不清库：每个测试用的键都是唯一的（Key 的哈希是随机的，限流的桶按 Key 的 ID 分），
+// 所以可以并行。
 func New(t testing.TB) *redis.Client {
 	t.Helper()
 	once.Do(open)

@@ -1,4 +1,4 @@
-// Package apikey 负责 API Key 的生成、哈希、鉴权和存取。
+// Package apikey 负责 API Key 的生成、哈希、鉴权、鉴权缓存和存取。
 // 数据库里只存 Key 的 SHA-256，明文只在创建时返回一次，见 docs/adr/0003。
 package apikey
 
