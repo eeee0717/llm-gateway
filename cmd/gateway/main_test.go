@@ -18,6 +18,7 @@ import (
 
 	"github.com/eeee0717/llm-gateway/internal/config"
 	"github.com/eeee0717/llm-gateway/internal/mockupstream"
+	"github.com/eeee0717/llm-gateway/internal/openai"
 	"github.com/eeee0717/llm-gateway/internal/testdb"
 	"github.com/eeee0717/llm-gateway/internal/testredis"
 )
@@ -108,6 +109,32 @@ func TestStreamingRequestIsBilledFromUpstreamUsage(t *testing.T) {
 	require.EqualValues(t, credited-costPerRequest, balanceOf(t, db, keyID))
 }
 
+// M3 收口断言：Key 被禁用后立即失效，不用等鉴权缓存过期。
+// 在一个实例上禁用，另一个实例的下一个请求就该被拒——两个实例共用同一套 Redis，
+// 禁用时删掉的是那份共享的缓存。
+func TestDisabledKeyStopsWorkingImmediatelyOnEveryInstance(t *testing.T) {
+	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
+	t.Cleanup(upstream.Close)
+	cfg := testConfig(upstream.URL)
+	logger := slog.New(slog.DiscardHandler)
+	first, second := startInstance(t, cfg, logger), startInstance(t, cfg, logger)
+	key, keyID := createKey(t, first, 1_000_000)
+
+	// 两个实例各跑一次，把这个 Key 灌进各自看到的那份缓存
+	require.Equal(t, http.StatusOK, chat(t.Context(), first.business, key))
+	require.Equal(t, http.StatusOK, chat(t.Context(), second.business, key))
+
+	adminPost(t, first.admin, fmt.Sprintf("/admin/keys/%d/disable", keyID), ``, nil)
+
+	for name, gw := range map[string]instance{"same instance": first, "other instance": second} {
+		t.Run(name, func(t *testing.T) {
+			status, code := chatOnce(t, gw.business, key)
+			require.Equal(t, http.StatusUnauthorized, status)
+			require.Equal(t, "key_disabled", code) // 说明是鉴权挡下的，不是预扣挡下的
+		})
+	}
+}
+
 // instance 是一个网关实例的两个端口。
 type instance struct {
 	business string
@@ -185,6 +212,22 @@ func chat(ctx context.Context, url, key string) int {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body) // 响应体读完，连接才能复用
 	return resp.StatusCode
+}
+
+// chatOnce 发一个非流式请求，返回状态码和错误响应里的 code，成功时 code 为空。
+func chatOnce(t *testing.T, url, key string) (int, string) {
+	t.Helper()
+	body := `{"model":"mock-model","messages":[{"role":"user","content":"a"}]}`
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url+"/v1/chat/completions", strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	t.Cleanup(func() { resp.Body.Close() })
+	var failure openai.ErrorResponse
+	_ = json.NewDecoder(resp.Body).Decode(&failure)
+	return resp.StatusCode, failure.Error.Code
 }
 
 // chatStream 发一个流式请求，读完整个流，返回状态码和收到的内容。

@@ -160,7 +160,7 @@ func build(cfg *config.Config, db *gorm.DB, rdb *redis.Client, logger *slog.Logg
 	keys := apikey.NewStore(db)
 	cache := apikey.NewCache(rdb, keys, logger)
 	rh := relay.New(cfg, biller{billing.New(db, prices(cfg))}, logger)
-	ah := admin.New(logger, keys)
+	ah := admin.New(logger, keys, cache)
 	return server.New(logger, rh, apikey.Middleware(logger, cache)),
 		server.NewAdmin(logger, ah, admin.Auth(cfg.Admin.Key))
 }

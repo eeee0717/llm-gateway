@@ -17,6 +17,7 @@ import (
 	"github.com/eeee0717/llm-gateway/internal/apikey"
 	"github.com/eeee0717/llm-gateway/internal/server"
 	"github.com/eeee0717/llm-gateway/internal/testdb"
+	"github.com/eeee0717/llm-gateway/internal/testredis"
 )
 
 const adminKey = "admin-secret"
@@ -200,7 +201,9 @@ func startAdmin(t *testing.T) *adminServer {
 	t.Helper()
 	db := testdb.New(t)
 	logger := slog.New(slog.DiscardHandler)
-	srv := httptest.NewServer(server.NewAdmin(logger, admin.New(logger, apikey.NewStore(db)), admin.Auth(adminKey)))
+	keys := apikey.NewStore(db)
+	cache := apikey.NewCache(testredis.New(t), keys, logger)
+	srv := httptest.NewServer(server.NewAdmin(logger, admin.New(logger, keys, cache), admin.Auth(adminKey)))
 	t.Cleanup(srv.Close)
 	return &adminServer{url: srv.URL, db: db}
 }

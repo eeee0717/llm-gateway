@@ -3,6 +3,7 @@
 package admin
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"log/slog"
@@ -20,11 +21,12 @@ import (
 // Handler 处理 /admin 下的接口。
 type Handler struct {
 	keys   *apikey.Store
+	cache  *apikey.Cache
 	logger *slog.Logger
 }
 
-func New(logger *slog.Logger, keys *apikey.Store) *Handler {
-	return &Handler{keys: keys, logger: logger}
+func New(logger *slog.Logger, keys *apikey.Store, cache *apikey.Cache) *Handler {
+	return &Handler{keys: keys, cache: cache, logger: logger}
 }
 
 // Auth 校验管理员密钥。Authorization 头必须写成 Bearer 形式，裸密钥不算数。
@@ -59,6 +61,8 @@ func (h *Handler) CreateKey(c *gin.Context) {
 		h.internalError(c, "create api key", err)
 		return
 	}
+	// 建之前可能有人拿这个哈希查过，缓存里记着"不存在"，清掉它
+	h.cache.Forget(c.Request.Context(), key.KeyHash)
 	c.JSON(http.StatusCreated, view(key, plain))
 }
 
@@ -95,15 +99,27 @@ func (h *Handler) Limit(c *gin.Context) {
 		return
 	}
 	h.respond(c, func(id int64) (apikey.Key, error) {
-		return h.keys.SetRPMLimit(c.Request.Context(), id, body.RPMLimit)
+		key, err := h.keys.SetRPMLimit(c.Request.Context(), id, body.RPMLimit)
+		h.forget(c.Request.Context(), key, err)
+		return key, err
 	})
 }
 
 // Disable 处理 POST /admin/keys/:id/disable：停用一个 Key，余额保留。
+// 先改数据库再删鉴权缓存，删完之后下一个请求必然回源，禁用立刻生效，见 docs/adr/0002。
 func (h *Handler) Disable(c *gin.Context) {
 	h.respond(c, func(id int64) (apikey.Key, error) {
-		return h.keys.Disable(c.Request.Context(), id)
+		key, err := h.keys.Disable(c.Request.Context(), id)
+		h.forget(c.Request.Context(), key, err)
+		return key, err
 	})
+}
+
+// forget 删掉刚改过的那个 Key 的鉴权缓存。改动没成功就什么也不做。
+func (h *Handler) forget(ctx context.Context, key apikey.Key, err error) {
+	if err == nil {
+		h.cache.Forget(ctx, key.KeyHash)
+	}
 }
 
 // respond 解析路径里的 Key ID，执行 do，再把结果写回。
