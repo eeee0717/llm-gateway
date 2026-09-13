@@ -1,6 +1,6 @@
 # llm-gateway
 
-OpenAI 兼容的 LLM 网关，Go 单体服务：调用方凭 API Key 调用多个上游的模型，网关负责鉴权、限流和转发，并按用量从余额中扣费。当前进度：M1 转发、M2 Key 与计费已完成，下一个里程碑是 **M3**。
+OpenAI 兼容的 LLM 网关，Go 单体服务：调用方凭 API Key 调用多个上游的模型，网关负责鉴权、限流和转发，并按用量从余额中扣费。当前进度：M1 转发、M2 Key 与计费、M3 Redis 已完成，下一个里程碑是 **M4**。
 
 术语以 `CONTEXT.md` 为准，代码、文档、注释里的叫法都跟它一致；出现新的领域术语就补进去，那里只收术语、不写实现。
 
@@ -51,7 +51,7 @@ internal/
   relay/          /v1/chat/completions 与 /v1/models：模型路由、请求改写、SSE 透传、用量解析与估算
   billing/        费用计算、预扣、结算、用量记录
   apikey/         Key 生成与哈希、鉴权中间件、鉴权缓存、禁用
-  ratelimit/      令牌桶限流（Redis Lua）
+  ratelimit/      令牌桶限流（Redis Lua）；中间件接一个 Caller 函数，不 import apikey
   admin/          管理接口
   requestid/      请求 ID（relay 与 admin 共用，单独成包以免循环依赖）
   config/         配置加载与校验
@@ -71,7 +71,7 @@ docs/notes/       每个功能一页说明
 - 接口由使用方定义：`relay` 自己声明只含预扣和结算的小接口，由 `cmd/gateway` 注入 billing 的实现，relay 不 import billing。
 - 包写出代码后，职责以包注释为准。
 
-一次聊天请求依次经过：鉴权（apikey，先查鉴权缓存）→ 限流（ratelimit）→ 预扣（billing，PG 条件更新）→ 转发（relay）→ 结算（billing，与用量记录同一事务）。改动计费、余额、鉴权缓存或 API Key 存储之前，先读 `docs/adr/` 里对应的 ADR：0001 预扣与结算，0002 余额与 Redis 的分工，0003 API Key 哈希。
+一次聊天请求依次经过：鉴权（apikey，先查鉴权缓存）→ 限流（ratelimit）→ 预扣（billing，PG 条件更新）→ 转发（relay）→ 结算（billing，与用量记录同一事务）。改动计费、余额、鉴权缓存、限流或 API Key 存储之前，先读 `docs/adr/` 里对应的 ADR：0001 预扣与结算，0002 余额与 Redis 的分工，0003 API Key 哈希，0004 按 Key 的令牌桶。
 
 ## 设计约束
 
