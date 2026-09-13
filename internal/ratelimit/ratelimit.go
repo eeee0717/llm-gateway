@@ -70,14 +70,22 @@ func New(rdb *redis.Client, now func() time.Time, logger *slog.Logger) *Limiter 
 	return &Limiter{rdb: rdb, now: now, logger: logger}
 }
 
-// Allow 为这个 Key 取走一个令牌。取不到时返回还要等多久。
+// Allow 为这个 Key 取走一个令牌。取不到时返回还要等多久。rpm 必须是正数。
 // Redis 出任何问题都放行：限流是保护上游的，拒绝请求的代价比放过几个大。
 func (l *Limiter) Allow(ctx context.Context, keyID int64, rpm int) (bool, time.Duration) {
+	if rpm <= 0 {
+		// 没有额度可言就不限流。脚本拿 rpm 当补充速率的分母，0 会算出无穷大的等待时间，
+		// 负数会算出负的等待时间，两种都会变成没法遵守的 Retry-After。
+		return true, 0
+	}
 	key := keyPrefix + fmt.Sprint(keyID)
 	res, err := bucket.Run(ctx, l.rdb, []string{key},
 		rpm, l.now().UnixMilli(), idleTTL.Milliseconds()).Int64Slice()
-	if err != nil {
-		l.logger.WarnContext(ctx, "rate limit check failed, letting the request through", "error", err)
+	if err != nil || len(res) < 2 {
+		// 调用方自己断开时这里也会失败，那不是 Redis 的问题，不用记进日志
+		if ctx.Err() == nil {
+			l.logger.WarnContext(ctx, "rate limit check failed, letting the request through", "error", err)
+		}
 		return true, 0
 	}
 	if res[0] == 1 {

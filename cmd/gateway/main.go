@@ -120,6 +120,9 @@ func openRedis(url string) (*redis.Client, error) {
 	opts.ReadTimeout = 100 * time.Millisecond
 	opts.WriteTimeout = 100 * time.Millisecond
 	opts.MaxRetries = -1 // go-redis 里 -1 是"不重试"，0 才是默认的重试 3 次
+	// 连接池满了之后等多久。不设的话 go-redis 会推导成 ReadTimeout + 1 秒，
+	// 等于给上面那 100 毫秒又加了一秒——而池被占满正是 Redis 不响应时最容易出现的情况。
+	opts.PoolTimeout = 200 * time.Millisecond
 	return redis.NewClient(opts), nil
 }
 

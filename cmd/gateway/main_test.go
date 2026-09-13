@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -236,6 +237,56 @@ func TestGatewayKeepsWorkingWithoutRedis(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, chat(t.Context(), broken.business, key))
 	require.EqualValues(t, credited-costPerRequest, balanceOf(t, db, keyID))
+}
+
+// Redis 连得上但不回数据时，请求不能卡住。这是 fail-open 最难对付的一种故障：
+// 连接被拒绝是立刻知道的，不响应却要等到超时，而超时是按每个请求付出的。
+func TestGatewayDoesNotStallOnAnUnresponsiveRedis(t *testing.T) {
+	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
+	t.Cleanup(upstream.Close)
+	cfg := testConfig(upstream.URL)
+	logger := slog.New(slog.DiscardHandler)
+	key, _ := createKey(t, startInstance(t, cfg, logger), 1_000_000)
+
+	silent, err := openRedis("redis://" + blackhole(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { silent.Close() })
+	gw := startInstanceWith(t, cfg, silent, logger)
+
+	start := time.Now()
+	require.Equal(t, http.StatusOK, chat(t.Context(), gw.business, key))
+	// 一个请求最多碰三次 Redis：读缓存、回填缓存、取令牌。每次都要等满超时。
+	require.Less(t, time.Since(start), time.Second)
+}
+
+// blackhole 起一个只接受连接、之后什么也不回的监听，用来冒充一个不响应的 Redis。
+func blackhole(t *testing.T) string {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	return ln.Addr().String()
 }
 
 // instance 是一个网关实例的两个端口。

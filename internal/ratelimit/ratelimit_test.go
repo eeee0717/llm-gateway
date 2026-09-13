@@ -121,6 +121,18 @@ func TestRefillStopsAtCapacity(t *testing.T) {
 	require.Equal(t, rpm, allowed)
 }
 
+// 额度不是正数时不限流。脚本按容量算补充速率：容量为 0 会算出无穷大的等待时间，
+// 传到 Go 这边溢出成负数，调用方收到 429 加一个 Retry-After: 0，会立刻重试，空转成热循环。
+func TestAllowPassesWhenTheQuotaIsNotPositive(t *testing.T) {
+	l, _ := newLimiter(t)
+
+	for _, quota := range []int{0, -5} {
+		ok, retryAfter := l.Allow(t.Context(), rand.Int64(), quota)
+		require.True(t, ok, "额度 %d", quota)
+		require.Zero(t, retryAfter, "额度 %d", quota)
+	}
+}
+
 // 被拒的请求要知道等多久：额度 60 时下一个令牌在一秒后。
 func TestRetryAfterIsTheWaitForTheNextToken(t *testing.T) {
 	l, _ := newLimiter(t)

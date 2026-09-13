@@ -19,6 +19,8 @@ const (
 	// missTTL 是"这个 Key 不存在"记多久，短一些：它挡的是拿随机 Key 反复打过来的请求，
 	// 而一个刚建出来的 Key 不该因为之前有人查过就用不了太久。
 	missTTL = 30 * time.Second
+	// forgetTimeout 是删缓存这一步自己的超时。它不跟着管理员的请求走，所以得有个上限。
+	forgetTimeout = time.Second
 )
 
 // Identity 是鉴权要用的 Key 信息：身份和限流额度。余额不在里面——余额只有 PostgreSQL 一份，
@@ -62,9 +64,15 @@ func (c *Cache) IdentityByHash(ctx context.Context, hash string) (Identity, erro
 }
 
 // Forget 删掉一个 Key 的缓存。禁用或者改额度之后调用，让改动立刻生效，不用等 TTL。
+//
+// 这一步不跟着管理员的请求取消：数据库已经改完了，管理员这时断开连接的话，缓存就留着不删，
+// 被禁用的 Key 还能再用一个 TTL。和结算的处理是一回事，见 internal/relay。
+// 删不掉时只能记日志：改动仍然会在 TTL 到期后生效，而管理员那边的操作确实成功了。
 func (c *Cache) Forget(ctx context.Context, hash string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), forgetTimeout)
+	defer cancel()
 	if err := c.rdb.Del(ctx, cachePrefix+hash).Err(); err != nil {
-		c.logger.ErrorContext(ctx, "auth cache delete failed", "error", err)
+		c.logger.ErrorContext(ctx, "auth cache delete failed", "error", err, "ttl", hitTTL)
 	}
 }
 
