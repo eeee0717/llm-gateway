@@ -137,6 +137,47 @@ func TestDisabledKeyStopsWorkingImmediatelyOnEveryInstance(t *testing.T) {
 	}
 }
 
+// 鉴权缓存确实挡在数据库前面，而且只有走管理接口的改动才能立刻穿透它。
+// 绕过管理接口直接改库，缓存里的旧身份还在用——这就是 docs/notes/auth-cache.md 里
+// 那个陈旧窗口，它的后果是被禁用的 Key 落到预扣上被挡下（429），而不是鉴权挡下（401）。
+func TestAuthCacheHoldsTheIdentityUntilAdminInvalidatesIt(t *testing.T) {
+	db := testdb.New(t)
+	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
+	t.Cleanup(upstream.Close)
+	gw := startInstance(t, testConfig(upstream.URL), slog.New(slog.DiscardHandler))
+	key, keyID := createKey(t, gw, 1_000_000)
+	require.Equal(t, http.StatusOK, chat(t.Context(), gw.business, key)) // 把身份灌进缓存
+
+	require.NoError(t, db.Exec(`UPDATE api_keys SET disabled = TRUE WHERE id = ?`, keyID).Error)
+
+	status, code := chatOnce(t, gw.business, key)
+	require.Equal(t, http.StatusTooManyRequests, status)
+	require.Equal(t, "insufficient_quota", code) // 鉴权放行了，是预扣挡下的
+
+	adminPost(t, gw.admin, fmt.Sprintf("/admin/keys/%d/disable", keyID), ``, nil)
+
+	status, code = chatOnce(t, gw.business, key)
+	require.Equal(t, http.StatusUnauthorized, status)
+	require.Equal(t, "key_disabled", code)
+}
+
+// 改额度同样立刻生效：改完删缓存，下一个请求读到的就是新额度。
+func TestChangingTheQuotaTakesEffectImmediately(t *testing.T) {
+	upstream := httptest.NewServer(mockupstream.New(mockupstream.Options{Tokens: 3}))
+	t.Cleanup(upstream.Close)
+	gw := startInstance(t, testConfig(upstream.URL), slog.New(slog.DiscardHandler))
+	key, keyID := createKey(t, gw, 1_000_000)
+	require.Equal(t, http.StatusOK, chat(t.Context(), gw.business, key)) // 灌缓存，这时额度还是配置里的默认值
+
+	adminPost(t, gw.admin, fmt.Sprintf("/admin/keys/%d/limit", keyID), `{"rpm_limit":1}`, nil)
+
+	// 容量一改小，桶里的令牌也被压到新容量，所以只剩一个
+	require.Equal(t, http.StatusOK, chat(t.Context(), gw.business, key))
+	status, code := chatOnce(t, gw.business, key)
+	require.Equal(t, http.StatusTooManyRequests, status)
+	require.Equal(t, "rate_limit_exceeded", code) // 缓存没删的话，这里用的还是那个很大的默认额度
+}
+
 // M3 收口断言：限流放行的请求总数正确。
 // 把这个 Key 的额度设成每分钟 6 个，瞬间打 300 个请求：桶一开始是满的，正好放行 6 个，其余都被拒。
 //
