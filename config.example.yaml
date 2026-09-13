@@ -25,9 +25,10 @@ upstreams:
   - name: mock
     base_url: http://localhost:9090/v1
     key_env: MOCK_API_KEY
+  # 地址也可以只写变量名，用 base_url_env 代替 base_url：
   # - name: deepseek
-  #   base_url: https://api.deepseek.com/v1
-  #   key_env: DEEPSEEK_API_KEY
+  #   base_url_env: UPSTREAM_BASE_URL
+  #   key_env: UPSTREAM_API_KEY
 
 # 单价的单位是元每百万 token；default_max_tokens 是调用方没指定输出上限时的默认值，预扣按它计算。
 models:

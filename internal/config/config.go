@@ -49,10 +49,11 @@ type RateLimit struct {
 
 // Upstream 是一个上游。
 type Upstream struct {
-	Name    string `yaml:"name"`
-	BaseURL string `yaml:"base_url"` // 例如 https://api.deepseek.com/v1，网关在后面拼上 /chat/completions
-	KeyEnv  string `yaml:"key_env"`  // 存放上游密钥的环境变量名
-	Key     string `yaml:"-"`        // 上游密钥，加载时从 KeyEnv 读出，不写在文件里
+	Name       string `yaml:"name"`
+	BaseURL    string `yaml:"base_url"`     // 例如 https://api.deepseek.com/v1，网关在后面拼上 /chat/completions
+	BaseURLEnv string `yaml:"base_url_env"` // 存放上游地址的环境变量名，写了它就不用写 base_url
+	KeyEnv     string `yaml:"key_env"`      // 存放上游密钥的环境变量名
+	Key        string `yaml:"-"`            // 上游密钥，加载时从 KeyEnv 读出，不写在文件里
 }
 
 // Model 是一个模型：名称与上游的模型名一致，固定走一个上游，并带着自己的单价和默认输出上限。
@@ -115,11 +116,20 @@ func (c *Config) resolve() error {
 			return errors.New("upstream name is required")
 		case upstreams[u.Name]:
 			return fmt.Errorf("duplicate upstream %q", u.Name)
-		case !strings.HasPrefix(u.BaseURL, "http://") && !strings.HasPrefix(u.BaseURL, "https://"):
-			return fmt.Errorf("upstream %q: base_url must start with http:// or https://", u.Name)
 		}
 		upstreams[u.Name] = true
-		if u.Key, err = fromEnv(fmt.Sprintf("upstream %q", u.Name), "key_env", u.KeyEnv); err != nil {
+
+		what := fmt.Sprintf("upstream %q", u.Name)
+		// 地址也可以只写变量名：私有的中转地址不一定想写进配置文件。
+		if u.BaseURLEnv != "" {
+			if u.BaseURL, err = fromEnv(what, "base_url_env", u.BaseURLEnv); err != nil {
+				return err
+			}
+		}
+		if !strings.HasPrefix(u.BaseURL, "http://") && !strings.HasPrefix(u.BaseURL, "https://") {
+			return fmt.Errorf("upstream %q: base_url must start with http:// or https://", u.Name)
+		}
+		if u.Key, err = fromEnv(what, "key_env", u.KeyEnv); err != nil {
 			return err
 		}
 	}

@@ -6,6 +6,7 @@ coverage.out
 
 # 本地环境与 agent 协作目录
 .env
+.env.local
 /config.yaml
 /.context/
 

@@ -62,6 +62,19 @@ func TestLoadReadsSecretsFromEnv(t *testing.T) {
 	}, cfg)
 }
 
+// 上游地址也可以只写变量名。私有的中转地址不一定想写进配置文件，而配置文件是要进仓库的。
+func TestLoadReadsUpstreamBaseURLFromEnv(t *testing.T) {
+	setenv(t)
+	t.Setenv("TEST_UPSTREAM_URL", "https://proxy.example.com/v1")
+	content := strings.Replace(validConfig,
+		"    base_url: https://api.deepseek.com/v1\n", "    base_url_env: TEST_UPSTREAM_URL\n", 1)
+
+	cfg, err := config.Load(writeConfig(t, content))
+
+	require.NoError(t, err)
+	require.Equal(t, "https://proxy.example.com/v1", cfg.Upstreams[0].BaseURL)
+}
+
 func TestLoadDefaultsListenAddresses(t *testing.T) {
 	setenv(t)
 	noListen := strings.NewReplacer(`listen: ":9000"`, "", `  listen: ":9001"`, "").Replace(validConfig)
@@ -90,6 +103,8 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"no redis", strings.Replace(validConfig, "  url_env: TEST_REDIS_URL\n", "", 1), "url_env"},
 		{"rate limit not positive", strings.Replace(validConfig, "default_rpm: 60", "default_rpm: 0", 1), "default_rpm"},
 		{"base url without scheme", strings.Replace(validConfig, "https://", "", 1), "base_url"},
+		{"base url env not set", strings.Replace(validConfig,
+			"    base_url: https://api.deepseek.com/v1\n", "    base_url_env: TEST_UNSET_URL\n", 1), "TEST_UNSET_URL"},
 		{"unknown upstream", strings.Replace(validConfig, "upstream: deepseek", "upstream: openai", 1), `"openai"`},
 		{"duplicate model", validConfig + "  - name: deepseek-chat\n    upstream: deepseek\n", `"deepseek-chat"`},
 		{"model without output limit", strings.Replace(validConfig, "    default_max_tokens: 4096\n", "", 1), "default_max_tokens"},
