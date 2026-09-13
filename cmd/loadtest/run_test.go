@@ -53,7 +53,7 @@ func TestBothSidesShareTheSameTimeWindow(t *testing.T) {
 	defer up.Close()
 	both := [2]target{{Name: "direct", URL: up.URL + "/v1"}, {Name: "gateway", URL: up.URL + "/v1"}}
 
-	got, err := run(t.Context(), http.DefaultClient, both, probe, 20, 1, 0)
+	got, err := measure(t.Context(), http.DefaultClient, both, probe, 20, 1, 0)
 
 	require.NoError(t, err)
 	require.Equal(t, 0, got.Errors)
@@ -68,7 +68,7 @@ func TestRunStopsAtTheFirstErrorInsteadOfReportingNonsense(t *testing.T) {
 	defer up.Close()
 	both := [2]target{{Name: "direct", URL: up.URL + "/v1"}, {Name: "gateway", URL: up.URL + "/v1"}}
 
-	_, err := run(t.Context(), http.DefaultClient, both, probe, 4, 2, 0)
+	_, err := measure(t.Context(), http.DefaultClient, both, probe, 4, 2, 0)
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "502")

@@ -67,14 +67,14 @@ type report struct {
 	Errors  int
 }
 
-// run 打 n 对请求：每一对在两端各打一次。
+// measure 打 n 对请求：每一对在两端各打一次。
 //
 // 两端交替着打，而不是先跑完一端再跑另一端。上游的延迟本来就随时间漂移，
 // 分开跑的话两组经历的是不同的时间窗口，差出来的是漂移而不是网关的开销。
 // 每一对内部的先后也轮换，免得固定排在后面的那端总是沾到前一次刚热好的连接。
 //
 // interval 大于 0 时限速：所有 worker 共用一个 ticker，每发一个请求取一次。
-func run(ctx context.Context, c *http.Client, targets [2]target, body []byte, n, workers int, interval time.Duration) (report, error) {
+func measure(ctx context.Context, c *http.Client, targets [2]target, body []byte, n, workers int, interval time.Duration) (report, error) {
 	var tick <-chan time.Time
 	if interval > 0 {
 		t := time.NewTicker(interval)
