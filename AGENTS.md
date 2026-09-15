@@ -18,7 +18,7 @@ OpenAI 兼容的 LLM 网关，Go 单体服务：调用方凭 API Key 调用多�
 | 里程碑 | 内容 | 收口断言 |
 |---|---|---|
 | M1 转发 | 配置加载；多个上游按模型路由；流式与非流式透传；采集用量；中途断开时取消上游请求；`GET /v1/models`；mock 上游（输出确定、可配延迟、可注入故障、可模拟上游中途出错）。不含鉴权和计费 | 中途断开后 mock 上游观测到请求被取消，并得到估算用量；上游中途出错时调用方收到错误；流式与非流式都采集到上游报告的用量；调用方没要求 usage 时，流里没有只含 usage 的事件 |
-| M2 Key 与计费 | docker compose（PG + Redis）、goose 迁移、管理接口、鉴权（不接缓存）、预扣与结算、用量记录 | 两个网关实例共用一套 PG，1000 个并发请求打同一个 API Key，余额零超扣 |
+| M2 Key 与计费 | docker compose（MySQL + Redis）、goose 迁移、管理接口、鉴权（不接缓存）、预扣与结算、用量记录 | 两个网关实例共用一套 MySQL，1000 个并发请求打同一个 API Key，余额零超扣 |
 | M3 Redis | 鉴权缓存、令牌桶限流 | Key 被禁用后立即失效；限流放行的请求总数正确 |
 | M4 交付 | 首 token 延迟压测、Dockerfile、compose 一键启动全套服务、CI、README | 测出经过网关比直连多出的首 token 延迟 P99 |
 
@@ -29,14 +29,14 @@ README 里的数字只写实测结果：M2 的余额零超扣断言和 M4 的首
 | 用途 | 选择 |
 |---|---|
 | HTTP | Gin |
-| 数据库 | PostgreSQL + GORM，驱动 pgx |
+| 数据库 | MySQL 8.4 + GORM，驱动 go-sql-driver；连接串的必备开关由 `config.NormalizeDSN` 补齐，见 ADR-0006 |
 | 迁移 | goose：SQL 文件放 `migrations/`，embed 进二进制，由 `gateway migrate` 执行 |
 | Redis | go-redis v9 |
 | 并发合并 | `golang.org/x/sync/singleflight`：鉴权缓存的回源合并成一次，见 ADR-0005 |
 | 日志 | `log/slog`；Gin 的访问日志由自写中间件接到 slog |
 | 配置 | 一个 YAML 文件，用 `go.yaml.in/yaml/v3` 解析（`gopkg.in/yaml.v3` 已归档）。上游密钥和管理员密钥只从环境变量读取，YAML 里只写变量名，如 `key_env: DEEPSEEK_API_KEY` |
 | 测试 | testify 的 `require`；静态检查用 golangci-lint |
-| 交付 | 多阶段构建 + distroless 镜像；本地依赖由 OrbStack + docker compose 提供，测试也连这套服务；CI 用 GitHub Actions，PG 和 Redis 用 service container |
+| 交付 | 多阶段构建 + distroless 镜像；本地依赖由 OrbStack + docker compose 提供，测试也连这套服务；CI 用 GitHub Actions，MySQL 和 Redis 用 service container |
 
 依赖以这张表为限，其余用标准库；需要表外的依赖时先问人，定下来后写 ADR。
 
@@ -59,11 +59,11 @@ internal/
   sse/            按事件读取 SSE，保留原始字节以便原样转发
   openai/         用到的 OpenAI 协议子集与错误响应
   mockupstream/   mock 上游实现，测试与 cmd/mockupstream 共用
-  testdb/         测试用的数据库连接：连 compose 起的 PG，首次使用时执行迁移
+  testdb/         测试用的数据库连接：连 compose 起的 MySQL，首次使用时执行迁移
   testredis/      测试用的 Redis 连接：连 compose 起的那套
 migrations/       goose SQL 迁移，embed 进二进制
 scripts/          实验脚本，比如用量记录那条索引的实测依据
-compose.yaml      本地依赖：PostgreSQL 与 Redis
+compose.yaml      本地依赖：MySQL 与 Redis
 docs/adr/         难以逆转的决策，文件名 NNNN-英文短名.md
 docs/notes/       每个功能一页说明
 ```
@@ -73,7 +73,7 @@ docs/notes/       每个功能一页说明
 - 接口由使用方定义：`relay` 自己声明只含预扣和结算的小接口，由 `cmd/gateway` 注入 billing 的实现，relay 不 import billing。
 - 包写出代码后，职责以包注释为准。
 
-一次聊天请求依次经过：鉴权（apikey，先查鉴权缓存）→ 限流（ratelimit）→ 预扣（billing，PG 条件更新）→ 转发（relay）→ 结算（billing，与用量记录同一事务）。改动计费、余额、鉴权缓存、限流或 API Key 存储之前，先读 `docs/adr/` 里对应的 ADR：0001 预扣与结算，0002 余额与 Redis 的分工，0003 API Key 哈希，0004 按 Key 的令牌桶，0005 鉴权缓存的回源合并与 TTL 偏移。
+一次聊天请求依次经过：鉴权（apikey，先查鉴权缓存）→ 限流（ratelimit）→ 预扣（billing，MySQL 条件更新）→ 转发（relay）→ 结算（billing，与用量记录同一事务）。改动计费、余额、鉴权缓存、限流或 API Key 存储之前，先读 `docs/adr/` 里对应的 ADR：0001 预扣与结算，0002 余额与 Redis 的分工，0003 API Key 哈希，0004 按 Key 的令牌桶，0005 鉴权缓存的回源合并与 TTL 偏移，0006 换成 MySQL 之后哪些写法必须改。
 
 ## 设计约束
 
@@ -83,7 +83,7 @@ docs/notes/       每个功能一页说明
 - **取消传播**：上游请求从 `c.Request.Context()` 派生，调用方中途断开时上游请求随之取消。`*gin.Context` 虽然实现了 `context.Context`，但引擎没开 `ContextWithFallback` 时它的 `Done()` 返回 nil，传它就取消不了。结算用 `context.WithoutCancel`，保证中途断开后照样能结算。
 - **流式刷新**：每写完一个 SSE 事件就调用 `c.Writer.Flush()`。包装 `gin.ResponseWriter` 的中间件要保留 `Flush()`，并自己实现 `Unwrap()`（它不在 `gin.ResponseWriter` 接口里，嵌入接口得不到）；访问日志直接读 `c.Writer.Status()` 和 `Size()`，不用包装。业务端口的 `http.Server` 不设 `WriteTimeout`，访问上游的 `http.Client` 不设 `Timeout`，两者都会截断长流；等上游响应头用 `Transport.ResponseHeaderTimeout`，并调大 `MaxIdleConnsPerHost`（默认只有 2）。
 - **密钥隔离**：发往上游的只有上游密钥。上游返回 401/403 时统一转成 502 `upstream_auth_failed`，因为原始响应体里可能带有密钥片段；网关自己生成的错误信息里也不带上游地址。日志里的 API Key 只记 ID。
-- **测试走真实 HTTP**：用 `httptest` 起网关，用 `internal/mockupstream` 起上游，断言落在调用方能观测到的行为上，比如响应内容和 mock 的计数。M2 起测试连 docker compose 起的 PG 和 Redis。
+- **测试走真实 HTTP**：用 `httptest` 起网关，用 `internal/mockupstream` 起上游，断言落在调用方能观测到的行为上，比如响应内容和 mock 的计数。M2 起测试连 docker compose 起的 MySQL 和 Redis。
 
 ## 约定
 

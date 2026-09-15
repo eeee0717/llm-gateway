@@ -8,90 +8,102 @@
 
 ## 方案
 
-`scripts/index-experiment.sh` 是可复现的那份实验：往一张和 `usage_records` 同构的 `usage_records_bench` 里灌 100 万行（`generate_series`），分散在 50 个 Key 上，时间摊在最近 30 天里，然后在四种索引下对同一条查询各跑一次 `EXPLAIN (ANALYZE, BUFFERS)`。
+`scripts/index-experiment.sh` 是可复现的那份实验：往一张和 `usage_records` 同构的 `usage_records_bench` 里灌 100 万行（递归 CTE，MySQL 没有 `generate_series`），分散在 50 个 Key 上，时间摊在最近 30 天里，然后在四种索引下对同一条查询各跑一次 `EXPLAIN ANALYZE`。
 
 ```sql
 SELECT * FROM usage_records_bench
-WHERE api_key_id = 7 AND created_at >= now() - interval '7 days'
+WHERE api_key_id = 7 AND created_at >= NOW() - INTERVAL 7 DAY
 ORDER BY created_at DESC
 LIMIT 20;
 ```
 
-灌进去的表 99 MB，每个 Key 两万行，落在最近 7 天里的四千六百多行。行是按时间递增插入的，和真实的用量记录一样属于追加写，物理顺序天然跟着时间走；`api_key_id` 轮流取值，所以同一个 Key 的行均匀散在整张表里——这也和真实情况一致，多个调用方的请求是交错着结算的。
+灌进去的表 88 MB，每个 Key 两万行，落在最近 7 天里的四千六百多行。行按时间递增插入，和真实的用量记录一样属于追加写；`api_key_id` 轮流取值，所以同一个 Key 的行均匀散在整张表里——这也和真实情况一致，多个调用方的请求是交错着结算的。
 
-每种配置跑两次，取第二次（缓存热的那次）：
+MySQL 的 `EXPLAIN` 没有 PostgreSQL 那样的 `BUFFERS`，"这条计划到底翻了多少数据"改看 `Handler_read_*`：它数的是**存储引擎被要过多少行**，同样能把"扫全表"和"只读 20 行"分得清清楚楚。每种配置跑两次，取第二次（缓冲池热的那次）：
 
-| 索引 | 计划 | Buffers | 执行时间 | 索引大小 |
+| 索引 | 计划 | 引擎被要的行数 | 执行时间 | 索引大小 |
 |---|---|---|---|---|
-| 无 | Parallel Seq Scan + top-N heapsort | 12735 | 16.09 ms | — |
-| `(api_key_id)` | Bitmap Index Scan + Bitmap Heap Scan + top-N heapsort | 12684 | 8.96 ms | 6.8 MB |
-| `(api_key_id, created_at DESC)` | Index Scan | **19** | **0.048 ms** | 30 MB |
-| `(api_key_id, created_at)` | Index Scan Backward | 19 | 0.039 ms | 30 MB |
+| 无二级索引 | Table scan + Sort | `read_rnd_next` 1000022 | 145 ms | — |
+| `(api_key_id)` | Index lookup + Filter + Sort | `read_next` 20000 | 13.0 ms | 21.5 MB |
+| `(api_key_id, created_at DESC)` | Index range scan | `read_next` **19** | **0.029 ms** | 30.6 MB |
+| `(api_key_id, created_at)` | Index range scan **(reverse)** | `read_prev` 19 | 0.038 ms | 30.6 MB |
 
-**无索引**时要把 100 万行全扫一遍（三个并行进程各扔掉 331778 行），再做一次 top-N 排序。
+**无索引**时整张表扫一遍（`Table scan ... rows=1e+6`），筛出 4666 行，再排序取前 20。
 
-**只有 `api_key_id`** 时，索引本身很快就定位到那两万行（`Bitmap Index Scan ... rows=20000`），但接下来是 `Bitmap Heap Scan`，`Heap Blocks: exact=12658`——**整张表的堆块几乎一块不落地都摸了一遍**。因为这个 Key 的两万行均匀散在全表，一万两千多个块里差不多每块都有它一行。时间上的 12735 → 12684 个 buffer 说明了一切：读的量根本没减，省下的只是判断条件的那点 CPU。而且时间范围要在堆上过滤（`Rows Removed by Filter: 15334`），排序还得照做。
+**只有 `api_key_id`** 时，索引把这个 Key 的两万行定位出来（`Index lookup ... rows=20000`），但时间范围只能在这两万行上过滤，排序也还得做。比扫全表快十倍，因为不用再碰另外 98 万行；但代价和这个 Key 的历史记录总数成正比，表越长越慢。
 
-**联合索引**把 `created_at` 放进索引的第二列之后，`WHERE` 的两个条件一起进了 `Index Cond`，索引里这个 Key 的条目本来就按时间排好，扫到第 20 条就停：**19 个 buffer，0.048 毫秒，比只有单列快 186 倍**。`Sort` 节点消失了。
+**联合索引**把 `created_at` 放进第二列之后，两个条件一起进了 `Index range scan` 的范围，索引里这个 Key 的条目本来就按时间排好，扫到第 20 条就停：**引擎只被要了 19 行，0.029 毫秒，比只有单列快 450 倍**。`Sort` 节点消失了。
 
 ### `DESC` 写进定义省掉了什么
 
-**对这条查询，什么也没省。** 上表最后一行是故意做的对照：把索引定义成默认的升序 `(api_key_id, created_at)`，计划变成 `Index Scan Backward`，时间一样（0.039 对 0.048 毫秒，就是噪声）。B 树是双向链起来的，倒着扫和正着扫一样便宜，所以单列方向的 `ORDER BY ... DESC` 用升序索引就能满足。
+**对这条查询，什么也没省。** 上表最后一行是故意做的对照：把索引定义成默认的升序，计划还是同一个 `Index range scan`，只是后面多了个 `(reverse)`，Handler 计数器也从 `read_next` 换成了 `read_prev`——B 树的叶子是双向链起来的，倒着扫和正着扫一样便宜（0.038 对 0.029 毫秒，都在噪声里）。
 
 **消失的 `Sort` 节点是 `created_at` 进索引换来的，不是 `DESC` 换来的。** 这一点很容易记反。
 
-`DESC` 要在 `ORDER BY` 里同时出现两个方向时才起作用，因为反向扫给出的是"所有列都反过来"。实验第 5 步查三个 Key、按 `ORDER BY api_key_id, created_at DESC` 排：
+`DESC` 要在 `ORDER BY` 里同时出现两个方向时才起作用，因为反着扫给出的是"所有列都反过来"。实验第 5 步查三个 Key、按 `ORDER BY api_key_id, created_at DESC` 排：
 
-| 索引 | 计划 | Buffers | 执行时间 |
-|---|---|---|---|
-| `(api_key_id, created_at DESC)` | Index Scan | 16 | 0.041 ms |
-| `(api_key_id, created_at)` | Incremental Sort + Index Scan | 2985 | 4.31 ms |
+| 索引 | 计划 | 执行时间 |
+|---|---|---|
+| `(api_key_id, created_at DESC)` | Index range scan | 0.031 ms |
+| `(api_key_id, created_at)` | Sort + Index range scan (reverse) | 9.5 ms |
 
-升序索引这时只能保证 `api_key_id` 有序（`Presorted Key: api_key_id`），组内还得自己排，于是多出一个 `Incremental Sort`，而且得把这三个 Key 在 7 天内的 4667 行全取出来才排得动，两边差出的那 100 倍就是这么来的。
+升序索引这时排不出要的顺序，只能把这三个 Key 在 7 天内的 13998 行全取出来再排，慢了 300 倍。
 
-这个项目现在没有这样的查询——**所以 `DESC` 这四个字母今天是白写的**。留着它是因为它不要钱（索引大小一样、单 Key 查询一样快），而将来真要按多个 Key 分组取最近几条时，不用重建一遍 30 MB 的索引。
+这个项目现在没有这样的查询——**所以 `DESC` 这四个字母今天是白写的**。留着它是因为它不要钱（索引大小一模一样，单 Key 查询一样快），而将来真要按多个 Key 取最近几条时，不用重建一遍 30 MB 的索引。
 
 ### `model`、`estimated` 这类低基数字段
 
-`estimated` 只有两种取值，`model` 在这套配置里只有三种。单独给它们建索引没有意义，实验第 6 步跑的是 `estimated` 上的单列索引：
+`estimated` 只有两种取值，`model` 在这套配置里只有三种。实验第 6 步给 `estimated` 单独建了索引：
 
-- `WHERE estimated`（占 10%，十万行）：索引**用上了**，但 `Heap Blocks: exact=12659`——又是整张表的堆块。15.40 ms。
-- `WHERE NOT estimated`（占 90%）：规划器**直接不用**这条索引，走 Parallel Seq Scan。23.13 ms。
+- `WHERE estimated`（占 10%，十万行）：`Covering index range scan`，读 100000 行，14.3 ms。
+- `WHERE NOT estimated`（占 90%）：`Covering index lookup`，读 900000 行，101 ms。
 
-索引能省下来的是"不必碰的堆块"，而低基数列筛出来的行散落在每一个块里，省不掉任何一块；选中的行再多一些，走索引反而比顺序扫更贵（随机读加回表）。这类字段的正确位置是**跟在选择性高的列后面**，或者做部分索引（`WHERE estimated`），但这两种都得先有真实的查询才谈得上。
+有一件事要说清楚：**索引确实被用上了，但那只是因为 `count(*)` 能在索引里答完**（计划里的 `Covering`，不用回表）。它没有把要处理的行数缩小——十万行还是十万行，只是换了个地方数。真要把行取出来（`SELECT *`），还得拿二级索引里的主键回表，优化器这时宁可直接扫表。
 
-而索引的代价是实打实的。实验第 7 步同样插 20 万行：
+对照同一张表上的联合索引：19 行、0.029 毫秒。索引值钱的地方是**把要碰的行从一百万缩到二十**，而低基数列做不到这件事——它筛出来的行仍然遍布全表。这类字段的正确位置是跟在选择性高的列后面，或者做条件索引，但两种都得先有真实的查询才谈得上。
 
-| 目标表 | 耗时 |
+### InnoDB 的两个结构性差异
+
+表数据就存在主键那棵树里（聚簇索引），二级索引的叶子存的是**主键值**，不是行的物理位置。两个后果：
+
+- **二级索引比 PostgreSQL 的大。** 单列 `api_key_id` 索引 21.5 MB，同样的数据在 PostgreSQL 上是 6.8 MB——差的就是每条索引项都得带上主键值（`request_id`，26 个字符）。
+- **回表是再查一次主键树**，不是按行号直接取。所以"只读 20 行"这个结论更值钱：回表 20 次和回表四千次不是一回事。
+
+`usage_records` 的主键是随机的请求 ID，等于聚簇索引按随机值排序，插入落在树的各处。实验第 7 步量了这件事，同样插 20 万行：
+
+| 表的样子 | 耗时 |
 |---|---|
-| 没有索引 | 143.7 ms |
-| 带 `(api_key_id, created_at DESC)` | 208.5 ms |
+| 光板 | 348.6 ms |
+| 带 `(api_key_id, created_at DESC)` | 481.9 ms |
+| 随机的 `request_id` 做主键，加联合索引 | 851.1 ms |
+| 自增主键 + `request_id` 唯一键，加联合索引 | 975.3 ms |
 
-**多 45%**，摊到每行约 0.3 微秒。低基数索引付的就是这一份，换回来的是上面那两条计划。
+联合索引本身要 **+38%**。随机主键又贵一截，但换成"自增主键 + 唯一键"这个常见药方**反而更慢**：唯一键是另一条二级索引，随机插入的代价从聚簇索引搬到了它身上，还多出一整棵树要维护。所以 `request_id` 继续做主键，不改。
 
-顺带两条：联合索引的左前缀就是 `(api_key_id)`，所以**不需要再单独建一条 `api_key_id` 索引**，只按 Key 查（比如对账时的 `count(*)`）照样走它；`request_id` 是主键，结算的 `ON CONFLICT DO NOTHING` 走的是主键自带的唯一索引，和这条联合索引不相干。
+顺带两条：联合索引的左前缀就是 `(api_key_id)`，外键要求的索引由它顶上，`SHOW INDEX FROM usage_records` 里只有 `PRIMARY` 和这一条（`created_at` 那行的 `Collation` 是 `D`，降序）；结算的幂等靠主键冲突认出来，走的也是 `PRIMARY`，和这条联合索引不相干。
 
 ### 实验跑在什么环境上
 
-PostgreSQL 18.6（`postgres:18-alpine`），跑在 OrbStack 的容器里，宿主是 Apple M5，Docker 虚拟机分到 10 个 CPU、11.7 GB 内存。`shared_buffers = 160 MB`，`work_mem = 4 MB`，`effective_cache_size = 5 GB`，`random_page_cost = 4`，`max_parallel_workers_per_gather = 2`，都是镜像的默认值。
+MySQL 8.4.11（`mysql:8.4`），跑在 OrbStack 的容器里，宿主是 Apple M5，Docker 虚拟机分到 10 个 CPU、11.7 GB 内存。`innodb_buffer_pool_size = 128 MB`、`innodb_page_size = 16 KB`、`sort_buffer_size = 256 KB`、隔离级别 `REPEATABLE-READ`，都是镜像的默认值。
 
 ```sh
 docker compose up -d
-scripts/index-experiment.sh            # 约 8 秒，跑完把 bench 表删掉
+scripts/index-experiment.sh                # 约 16 秒，跑完把 bench 表删掉
 KEEP_TABLE=1 scripts/index-experiment.sh   # 留着表自己接着查
 ```
 
 ## 取舍
 
-- **建联合索引，不是只建 `api_key_id`。** 索引从 6.8 MB 涨到 30 MB（表本身 99 MB），换来 8.96 ms → 0.048 ms。用量记录只涨不减，而单列索引的问题会跟着表一起长大：它扫出来的行数和这个 Key 的历史记录总数成正比，联合索引只取要的那 20 行。
-- **除了主键，只建这一条索引。** 每多一条，结算就多一次 B 树维护，而结算在写路径上——压测时 PostgreSQL 的 CPU 已经占到 95%，是整套系统的瓶颈（见 [压测说明](loadtest.md)）。上面那 45% 是这条索引的价签，加第二条就再付一次。
-- **实验用的是同构的另一张表，不是 `usage_records` 本身。** 不带外键（外键只影响写，不影响这里测的读）、不带主键（主键是另一条索引，会掺进 `Buffers` 读数里），也就不用动真表上的索引，本地库和测试数据不受影响。
-- **数字是内存热的，读的时候要记住这一点。** 99 MB 的表整个装得进 160 MB 的 `shared_buffers`，所以 `Buffers` 那一行几乎全是 `hit`，顺序扫的 16 毫秒是"内存里扫 100 万行"的价钱。真实数据大到内存装不下时，这个差距只会更大：那 12735 个 buffer 里的绝大多数会变成磁盘读，而联合索引那一侧仍然只有 19 个。
-- **这条索引今天还没有查询在用。** 网关只往 `usage_records` 写，管理接口目前只暴露了余额，读记录的只有测试和人工对账。索引是为"管理员查用量"准备的——所以这一页要回答的是"它将来值不值这 30 MB 和 45%"，而不是"它现在省了多少"。
+- **建联合索引，不是只建 `api_key_id`。** 索引从 21.5 MB 涨到 30.6 MB（表本身 88 MB），换来 13.0 ms → 0.029 ms。用量记录只涨不减，而单列索引的问题会跟着表一起长大：它扫出来的行数和这个 Key 的历史记录总数成正比，联合索引只取要的那 20 行。
+- **除了主键，只建这一条索引。** 每多一条，结算就多一棵树要维护，而结算在写路径上——这套系统的瓶颈本来就是数据库（见 [压测说明](loadtest.md)）。上面那 38% 是这条索引的价签，加第二条就再付一次。
+- **实验用的是同构的另一张表，不是 `usage_records` 本身。** 不带外键（外键只影响写，不影响这里测的读），也不带主键——主键在 InnoDB 里就是表本身，带上它就没法测"完全没有索引时是什么样"。这样也不用动真表上的索引，本地库和测试数据不受影响。
+- **写入那组数字是批量插入量出来的，只能当量级看。** 真实的结算是一行一行写、每行一个事务，还要付 redo 刷盘（`innodb_flush_log_at_trx_commit = 1`）的钱，批量插入把这部分摊薄了。它能回答"多一条索引贵多少"这种相对问题，答不了"一次结算要多久"。
+- **数字是内存热的，读的时候要记住这一点。** 88 MB 的表整个装得进 128 MB 的缓冲池，扫全表的 145 毫秒是"在内存里扫 100 万行"的价钱。真实数据大到缓冲池装不下时，差距只会更大：扫表的那一百万行大多要从磁盘读，而联合索引那一侧仍然只有 19 行。
+- **这条索引今天还没有查询在用。** 网关只往 `usage_records` 写，管理接口目前只暴露了余额，读记录的只有测试和人工对账。索引是为"管理员查用量"准备的——所以这一页要回答的是"它将来值不值这 30 MB 和 38%"，而不是"它现在省了多少"。
 
 ## 延伸问题
 
 - 表一直涨怎么办？按月分区或者定期归档。这条查询天然带 `api_key_id` 和时间范围，分区裁剪对它正好合适，索引也跟着分区变小。
-- 要不要做覆盖索引（`INCLUDE (cost_micro, prompt_tokens, ...)`）省掉回表？这次的计划里回表只有十几个 buffer，省不出什么；而 `SELECT *` 要覆盖就得把整行塞进索引，索引会涨到和表一个量级。
-- 换成按游标翻页（`WHERE created_at < $上一页最后一条` ）会不会更好？会，而且用的还是这条索引：`OFFSET` 翻到第 100 页要先扫掉前面 2000 行，游标翻页每页都只读 20 行。等真有分页接口时再说。
-- 为什么写入只贵 45%？因为 `created_at` 取的是 `now()`、插入是追加的，新条目总落在索引最右边那一页上，B 树几乎不分裂。如果索引的第一列是随机值（比如把 `request_id` 建成索引），插入会散在整棵树上，代价要高得多。
+- 要不要做覆盖索引，把 `cost_micro` 这些列也塞进去省掉回表？MySQL 的二级索引没有 `INCLUDE`，想覆盖就得把列写进索引本身，索引会涨到和表一个量级；而这次回表只有 20 行。
+- 换成按游标翻页（`WHERE created_at < $上一页最后一条`）会不会更好？会，而且用的还是这条索引：`OFFSET` 翻到第 100 页要先扫掉前面 2000 行，游标翻页每页都只读 20 行。等真有分页接口时再说。
+- 时间列为什么不用 `TIMESTAMP`？它只存得到 2038 年，而这张表是一直往后写的。用的是 `DATETIME(6)`，它不带时区，所以时区由连接串锁死成 UTC，见 [ADR-0006](../adr/0006-mysql-instead-of-postgres.md)。

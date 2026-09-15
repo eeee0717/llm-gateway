@@ -42,7 +42,7 @@ func RandomJitter() time.Duration {
 	return time.Duration(rand.Int64N(int64(maxJitter)))
 }
 
-// Identity 是鉴权要用的 Key 信息：身份和限流额度。余额不在里面——余额只有 PostgreSQL 一份，
+// Identity 是鉴权要用的 Key 信息：身份和限流额度。余额不在里面——余额只有 MySQL 一份，
 // 缓存里的东西丢了都能重建，见 docs/adr/0002。
 type Identity struct {
 	ID       int64 `json:"id"`

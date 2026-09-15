@@ -12,7 +12,7 @@ OpenAI 兼容的 LLM 网关。调用方拿一个 API Key 调用多个上游的�
 - 多个上游按模型路由，每个模型固定走一个上游
 - 管理接口单开一个端口：建 Key、充值、改额度、禁用、查余额
 
-单体 Go 服务，非测试代码约 2200 行。技术栈：Gin、PostgreSQL（GORM + pgx）、Redis（go-redis）、goose 迁移、`log/slog`。
+单体 Go 服务，非测试代码约 2300 行。技术栈：Gin、MySQL 8.4（GORM + go-sql-driver）、Redis（go-redis）、goose 迁移、`log/slog`。
 
 ## 跑起来
 
@@ -22,7 +22,7 @@ OpenAI 兼容的 LLM 网关。调用方拿一个 API Key 调用多个上游的�
 docker compose --profile full up -d --build
 ```
 
-起 PostgreSQL、Redis、mock 上游和网关（业务端口 8080，管理端口 8081），迁移由一个跑完就退出的容器执行，网关等它成功之后才启动。等到 `docker compose logs gateway` 里出现 `listening` 就可以打了。
+起 MySQL、Redis、mock 上游和网关（业务端口 8080，管理端口 8081），迁移由一个跑完就退出的容器执行，网关等它成功之后才启动。等到 `docker compose logs gateway` 里出现 `listening` 就可以打了。
 
 建一个 Key 并充值 100 元：
 
@@ -51,7 +51,7 @@ curl -N -X POST localhost:8080/v1/chat/completions \
 
 ### 余额零超扣
 
-两个网关实例共用一套 PostgreSQL，1000 个并发请求打同一个 API Key，余额只够其中一部分成功。断言（`TestTwoInstancesDoNotOverspendOneKey`）：
+两个网关实例共用一套 MySQL，1000 个并发请求打同一个 API Key，余额只够其中一部分成功。断言（`TestTwoInstancesDoNotOverspendOneKey`）：
 
 - 每个请求要么成功、要么因为余额不够被 429 拒绝，没有第三种结果
 - **余额不小于零**
@@ -68,10 +68,10 @@ curl -N -X POST localhost:8080/v1/chat/completions \
                 N      min      p50      p90      p99      max
       direct  500  300.1ms  300.6ms  301.5ms  303.2ms  303.3ms
      gateway  500  302.3ms  308.1ms  319.6ms  334.8ms  347.3ms
-  gateway 多出        +2.1ms   +7.5ms  +18.1ms  +31.6ms  +43.9ms
+  gateway 多出        +3.6ms  +12.1ms  +21.6ms    +49ms  +59.2ms
 ```
 
-**P99 多出 31.6 毫秒**，中位数多出 7.5 毫秒。并发降到 5 时 P99 的差掉到 +18.3ms，而 min 几乎不动——固有开销约 2 毫秒，尾部是同一个 Key 的预扣在行锁上排队。测量方法和这个数字的读法见 [压测说明](docs/notes/loadtest.md)。
+**P99 多出 49 毫秒**，中位数多出 12.1 毫秒。并发降到 5 时 P99 的差掉到 +25ms，而 min 几乎不动——固有开销约 3 毫秒，尾部是同一个 Key 的预扣在行锁上排队。测量方法和这个数字的读法见 [压测说明](docs/notes/loadtest.md)。
 
 数字是在一台开发机上测的，网关、数据库、Redis 和压测程序共用同一份 CPU。
 
@@ -87,7 +87,7 @@ curl -N -X POST localhost:8080/v1/chat/completions \
 | 网关，20 个 Key | **3,192** | 14.3ms | 36.6ms |
 | 网关，全部打同一个 Key | 565 | 80.4ms | 222.9ms |
 
-瓶颈是 PostgreSQL——压测期间 PG 容器 CPU 占 95.5%，Redis 只有 13%；一个请求要写两次库。连接池从 20 放到 60 只换来 15% 的吞吐，所以那个限制没有卡住谁。**同一个 Key 和 20 个 Key 差 5.7 倍**，这是预扣行锁的直接代价，也是上面 P99 那条尾巴的实证。
+瓶颈是 MySQL——压测期间 MySQL 容器 CPU 占 84%，Redis 只有 7%；一个请求要写两次库。连接池从 20 放到 60 只换来 8% 的吞吐，所以那个限制没有卡住谁。**同一个 Key 和 20 个 Key 差 5 倍**（全打同一个 Key 时 MySQL 反而只占 22% CPU——它闲着，卡住的是那把行锁），这是预扣行锁的直接代价，也是上面 P99 那条尾巴的实证。
 
 ## 一次请求经过什么
 
@@ -95,15 +95,15 @@ curl -N -X POST localhost:8080/v1/chat/completions \
 鉴权 → 限流 → 预扣 → 转发 → 结算
 ```
 
-- **鉴权**（`internal/apikey`）：SHA-256 查 Redis 缓存，没有就回源 PostgreSQL 再写回；查不到的 Key 也记 30 秒，挡住拿随机 Key 反复打的情况；同一个哈希的并发回源合并成一次，TTL 带随机偏移，躲开击穿和雪崩
+- **鉴权**（`internal/apikey`）：SHA-256 查 Redis 缓存，没有就回源 MySQL 再写回；查不到的 Key 也记 30 秒，挡住拿随机 Key 反复打的情况；同一个哈希的并发回源合并成一次，TTL 带随机偏移，躲开击穿和雪崩
 - **限流**（`internal/ratelimit`）：一段 Lua 脚本在 Redis 里一次完成令牌的补充和扣减，多实例共享一个桶
 - **预扣**（`internal/billing`）：按 `输出上限 × 输出单价 + prompt token × 输入单价` 扣下最大可能的费用
 - **转发**（`internal/relay`）：流式响应逐个事件转发并 flush；调用方中途断开时上游请求随之取消
 - **结算**（`internal/billing`）：按上游报告的用量（或中途断开时的估算用量）多退少补，和用量记录同一个事务提交
 
-余额只有 PostgreSQL 一份，Redis 里的东西丢光了也只是慢一点、不会算错账，所以 Redis 故障时网关照常工作（[ADR-0002](docs/adr/0002-balance-in-postgres-only.md)）。
+余额只有 MySQL 一份，Redis 里的东西丢光了也只是慢一点、不会算错账，所以 Redis 故障时网关照常工作（[ADR-0002](docs/adr/0002-balance-in-mysql-only.md)）。
 
-至于"慢一点"是多少，实测过：把鉴权缓存摘掉，纯鉴权路径从 0.204ms 变成 0.228ms，**只差 0.02 毫秒**——PostgreSQL 那条查询走唯一索引、内存命中，本来就只要 0.011 毫秒。这层缓存买到的不是当下的速度，而是把读流量从最难水平扩的那一层挪走（[auth-cache](docs/notes/auth-cache.md)）。
+至于"慢一点"是多少，实测过：把鉴权缓存摘掉，纯鉴权路径从 0.204ms 变成 0.228ms，**只差 0.02 毫秒**——那条查询走唯一索引、内存命中，从 Go 这边量一次回源是 0.21 毫秒，和一次本机 Redis GET 同量级。这层缓存买到的不是当下的速度，而是把读流量从最难水平扩的那一层挪走（[auth-cache](docs/notes/auth-cache.md)）。
 
 ## 本地开发
 
@@ -111,7 +111,7 @@ curl -N -X POST localhost:8080/v1/chat/completions \
 
 ```sh
 mise install
-docker compose up -d        # 只起 PostgreSQL 和 Redis，测试连的就是这一套
+docker compose up -d        # 只起 MySQL 和 Redis，测试连的就是这一套
 go test -race ./...
 ```
 
@@ -133,10 +133,11 @@ go run ./cmd/loadtest -direct ... -gateway ...     # 首 token 延迟压测
 | ADR | |
 |---|---|
 | [0001](docs/adr/0001-reserve-then-settle.md) | 预扣与结算 |
-| [0002](docs/adr/0002-balance-in-postgres-only.md) | 余额只存 PostgreSQL，Redis 只做缓存和限流 |
+| [0002](docs/adr/0002-balance-in-mysql-only.md) | 余额只存 MySQL，Redis 只做缓存和限流 |
 | [0003](docs/adr/0003-api-key-sha256.md) | API Key 用 SHA-256 存哈希 |
 | [0004](docs/adr/0004-per-key-token-bucket.md) | 按 Key 的令牌桶，时间由网关提供 |
 | [0005](docs/adr/0005-singleflight-auth-cache-refill.md) | 鉴权缓存的回源合并成一次，TTL 带随机偏移 |
+| [0006](docs/adr/0006-mysql-instead-of-postgres.md) | 数据库用 MySQL 8.4，不用 PostgreSQL |
 
 | 说明 | |
 |---|---|
