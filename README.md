@@ -95,7 +95,7 @@ curl -N -X POST localhost:8080/v1/chat/completions \
 鉴权 → 限流 → 预扣 → 转发 → 结算
 ```
 
-- **鉴权**（`internal/apikey`）：SHA-256 查 Redis 缓存，没有就回源 PostgreSQL 再写回；查不到的 Key 也记 30 秒，挡住拿随机 Key 反复打的情况
+- **鉴权**（`internal/apikey`）：SHA-256 查 Redis 缓存，没有就回源 PostgreSQL 再写回；查不到的 Key 也记 30 秒，挡住拿随机 Key 反复打的情况；同一个哈希的并发回源合并成一次，TTL 带随机偏移，躲开击穿和雪崩
 - **限流**（`internal/ratelimit`）：一段 Lua 脚本在 Redis 里一次完成令牌的补充和扣减，多实例共享一个桶
 - **预扣**（`internal/billing`）：按 `输出上限 × 输出单价 + prompt token × 输入单价` 扣下最大可能的费用
 - **转发**（`internal/relay`）：流式响应逐个事件转发并 flush；调用方中途断开时上游请求随之取消
@@ -136,6 +136,7 @@ go run ./cmd/loadtest -direct ... -gateway ...     # 首 token 延迟压测
 | [0002](docs/adr/0002-balance-in-postgres-only.md) | 余额只存 PostgreSQL，Redis 只做缓存和限流 |
 | [0003](docs/adr/0003-api-key-sha256.md) | API Key 用 SHA-256 存哈希 |
 | [0004](docs/adr/0004-per-key-token-bucket.md) | 按 Key 的令牌桶，时间由网关提供 |
+| [0005](docs/adr/0005-singleflight-auth-cache-refill.md) | 鉴权缓存的回源合并成一次，TTL 带随机偏移 |
 
 | 说明 | |
 |---|---|

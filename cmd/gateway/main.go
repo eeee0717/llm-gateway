@@ -174,7 +174,7 @@ func pingRedis(rdb *redis.Client, logger *slog.Logger) {
 // build 组装两个端口的处理器。所有依赖都在这里接起来，测试也用它，测的就是真正跑起来的那套装配。
 func build(cfg *config.Config, db *gorm.DB, rdb *redis.Client, logger *slog.Logger) (business, management http.Handler) {
 	keys := apikey.NewStore(db)
-	cache := apikey.NewCache(rdb, keys, logger)
+	cache := apikey.NewCache(rdb, keys, apikey.RandomJitter, logger)
 	limiter := ratelimit.New(rdb, time.Now, logger)
 	rh := relay.New(cfg, biller{billing.New(db, prices(cfg))}, logger)
 	ah := admin.New(logger, keys, cache)

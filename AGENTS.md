@@ -32,6 +32,7 @@ README 里的数字只写实测结果：M2 的余额零超扣断言和 M4 的首
 | 数据库 | PostgreSQL + GORM，驱动 pgx |
 | 迁移 | goose：SQL 文件放 `migrations/`，embed 进二进制，由 `gateway migrate` 执行 |
 | Redis | go-redis v9 |
+| 并发合并 | `golang.org/x/sync/singleflight`：鉴权缓存的回源合并成一次，见 ADR-0005 |
 | 日志 | `log/slog`；Gin 的访问日志由自写中间件接到 slog |
 | 配置 | 一个 YAML 文件，用 `go.yaml.in/yaml/v3` 解析（`gopkg.in/yaml.v3` 已归档）。上游密钥和管理员密钥只从环境变量读取，YAML 里只写变量名，如 `key_env: DEEPSEEK_API_KEY` |
 | 测试 | testify 的 `require`；静态检查用 golangci-lint |
@@ -71,7 +72,7 @@ docs/notes/       每个功能一页说明
 - 接口由使用方定义：`relay` 自己声明只含预扣和结算的小接口，由 `cmd/gateway` 注入 billing 的实现，relay 不 import billing。
 - 包写出代码后，职责以包注释为准。
 
-一次聊天请求依次经过：鉴权（apikey，先查鉴权缓存）→ 限流（ratelimit）→ 预扣（billing，PG 条件更新）→ 转发（relay）→ 结算（billing，与用量记录同一事务）。改动计费、余额、鉴权缓存、限流或 API Key 存储之前，先读 `docs/adr/` 里对应的 ADR：0001 预扣与结算，0002 余额与 Redis 的分工，0003 API Key 哈希，0004 按 Key 的令牌桶。
+一次聊天请求依次经过：鉴权（apikey，先查鉴权缓存）→ 限流（ratelimit）→ 预扣（billing，PG 条件更新）→ 转发（relay）→ 结算（billing，与用量记录同一事务）。改动计费、余额、鉴权缓存、限流或 API Key 存储之前，先读 `docs/adr/` 里对应的 ADR：0001 预扣与结算，0002 余额与 Redis 的分工，0003 API Key 哈希，0004 按 Key 的令牌桶，0005 鉴权缓存的回源合并与 TTL 偏移。
 
 ## 设计约束
 

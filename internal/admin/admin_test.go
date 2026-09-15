@@ -202,7 +202,7 @@ func startAdmin(t *testing.T) *adminServer {
 	db := testdb.New(t)
 	logger := slog.New(slog.DiscardHandler)
 	keys := apikey.NewStore(db)
-	cache := apikey.NewCache(testredis.New(t), keys, logger)
+	cache := apikey.NewCache(testredis.New(t), keys, apikey.RandomJitter, logger)
 	srv := httptest.NewServer(server.NewAdmin(logger, admin.New(logger, keys, cache), admin.Auth(adminKey)))
 	t.Cleanup(srv.Close)
 	return &adminServer{url: srv.URL, db: db}
