@@ -148,6 +148,7 @@ go run ./cmd/loadtest -direct ... -gateway ...     # 首 token 延迟压测
 | [auth-cache](docs/notes/auth-cache.md) | 鉴权缓存的一致性 |
 | [rate-limit](docs/notes/rate-limit.md) | 令牌桶限流 |
 | [upstream-access](docs/notes/upstream-access.md) | 配置与上游访问 |
+| [indexing](docs/notes/indexing.md) | 用量记录的索引与实测 |
 | [loadtest](docs/notes/loadtest.md) | 首 token 延迟压测 |
 
 术语以 [CONTEXT.md](CONTEXT.md) 为准。

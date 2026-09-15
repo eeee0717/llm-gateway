@@ -22,7 +22,7 @@ CREATE TABLE usage_records (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 按 Key 查用量记录，最近的排在前面。
+-- 按 Key 查用量记录，最近的排在前面。选这两列的实测依据见 docs/notes/indexing.md。
 CREATE INDEX usage_records_api_key_id_created_at_idx ON usage_records (api_key_id, created_at DESC);
 
 -- +goose Down

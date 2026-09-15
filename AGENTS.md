@@ -62,6 +62,7 @@ internal/
   testdb/         测试用的数据库连接：连 compose 起的 PG，首次使用时执行迁移
   testredis/      测试用的 Redis 连接：连 compose 起的那套
 migrations/       goose SQL 迁移，embed 进二进制
+scripts/          实验脚本，比如用量记录那条索引的实测依据
 compose.yaml      本地依赖：PostgreSQL 与 Redis
 docs/adr/         难以逆转的决策，文件名 NNNN-英文短名.md
 docs/notes/       每个功能一页说明
