@@ -9,20 +9,21 @@ jobs:
   check:
     runs-on: ubuntu-latest
 
-    # 测试连的是真的 PostgreSQL 和 Redis，和本地 compose 起的那套一样，
+    # 测试连的是真的 MySQL 和 Redis，和本地 compose 起的那套一样，
     # 端口也一样，所以不用给测试额外设环境变量。
     services:
-      postgres:
-        image: postgres:18-alpine
+      mysql:
+        image: mysql:8.4
         env:
-          POSTGRES_USER: gateway
-          POSTGRES_PASSWORD: gateway
-          POSTGRES_DB: gateway
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: gateway
+          MYSQL_USER: gateway
+          MYSQL_PASSWORD: gateway
         ports:
-          - 5432:5432
+          - 3306:3306
         options: >-
-          --health-cmd "pg_isready -U gateway -d gateway"
-          --health-interval 2s --health-timeout 3s --health-retries 15
+          --health-cmd "mysql -ugateway -pgateway -e 'SELECT 1' gateway"
+          --health-interval 2s --health-timeout 3s --health-retries 30
       redis:
         image: redis:8-alpine
         ports:

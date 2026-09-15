@@ -67,17 +67,17 @@ func (s *Store) ByID(ctx context.Context, id int64) (Key, error) {
 
 // Credit 给余额加上 amountMicro，返回更新后的记录。充值是累加，不是设定值。
 func (s *Store) Credit(ctx context.Context, id, amountMicro int64) (Key, error) {
-	return s.update(ctx, `UPDATE api_keys SET balance_micro = balance_micro + ? WHERE id = ? RETURNING *`, amountMicro, id)
+	return s.update(ctx, id, `UPDATE api_keys SET balance_micro = balance_micro + ? WHERE id = ?`, amountMicro, id)
 }
 
 // SetRPMLimit 改一个 Key 的限流额度。传 0 表示改回"跟着配置走"。
 func (s *Store) SetRPMLimit(ctx context.Context, id int64, rpm int) (Key, error) {
-	return s.update(ctx, `UPDATE api_keys SET rpm_limit = ? WHERE id = ? RETURNING *`, rpm, id)
+	return s.update(ctx, id, `UPDATE api_keys SET rpm_limit = ? WHERE id = ?`, rpm, id)
 }
 
 // Disable 停用一个 Key，余额保留。
 func (s *Store) Disable(ctx context.Context, id int64) (Key, error) {
-	return s.update(ctx, `UPDATE api_keys SET disabled = TRUE WHERE id = ? RETURNING *`, id)
+	return s.update(ctx, id, `UPDATE api_keys SET disabled = TRUE WHERE id = ?`, id)
 }
 
 func (s *Store) find(ctx context.Context, where string, arg any) (Key, error) {
@@ -89,15 +89,27 @@ func (s *Store) find(ctx context.Context, where string, arg any) (Key, error) {
 	return key, err
 }
 
-// update 执行一条带 RETURNING 的更新，一条也没改到就是这个 Key 不存在。
-func (s *Store) update(ctx context.Context, sql string, args ...any) (Key, error) {
+// update 执行一条更新，再把更新后的记录读出来。
+//
+// MySQL 没有 RETURNING，这两步只能分开发，所以放进同一个事务：UPDATE 把这一行锁到提交为止，
+// 紧跟着的 SELECT 读到的就是这次改完的值，中间没有别人插进来的空档。
+//
+// 这个 Key 存不存在看 SELECT 的结果，而不是 UPDATE 改到了几行：把值改成和原来一样
+// （重复禁用、额度改成同一个数）同样是一次成功的更新，不该报成 Key 不存在。
+func (s *Store) update(ctx context.Context, id int64, sql string, args ...any) (Key, error) {
 	var key Key
-	res := s.db.WithContext(ctx).Raw(sql, args...).Scan(&key)
-	switch {
-	case res.Error != nil:
-		return Key{}, res.Error
-	case res.RowsAffected == 0:
-		return Key{}, ErrNotFound
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(sql, args...).Error; err != nil {
+			return err
+		}
+		err := tx.Where("id = ?", id).Take(&key).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrNotFound
+		}
+		return err
+	})
+	if err != nil {
+		return Key{}, err
 	}
 	return key, nil
 }

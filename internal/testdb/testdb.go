@@ -1,4 +1,4 @@
-// Package testdb 给测试提供数据库连接：连的是 docker compose 起的 PostgreSQL，第一次使用时执行迁移。
+// Package testdb 给测试提供数据库连接：连的是 docker compose 起的 MySQL，第一次使用时执行迁移。
 package testdb
 
 import (
@@ -7,17 +7,18 @@ import (
 	"sync"
 	"testing"
 
-	"gorm.io/driver/postgres"
+	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"github.com/eeee0717/llm-gateway/internal/config"
 	"github.com/eeee0717/llm-gateway/migrations"
 )
 
 // dsnEnv 是测试数据库连接串的环境变量名，没设置时连本地 compose 起的那套。
 const dsnEnv = "GATEWAY_TEST_DSN"
 
-const defaultDSN = "postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable"
+const defaultDSN = "gateway:gateway@tcp(localhost:3306)/gateway"
 
 var (
 	once     sync.Once
@@ -45,7 +46,12 @@ func DSN() string {
 }
 
 func open() {
-	sharedDB, openErr = gorm.Open(postgres.Open(DSN()), &gorm.Config{Logger: logger.Discard})
+	// 连接串上的几个必须开关由 NormalizeDSN 补齐，和网关自己开库走的是同一套，见 internal/config。
+	var dsn string
+	if dsn, openErr = config.NormalizeDSN(DSN()); openErr != nil {
+		return
+	}
+	sharedDB, openErr = gorm.Open(mysql.Open(dsn), &gorm.Config{Logger: logger.Discard, TranslateError: true})
 	if openErr != nil {
 		return
 	}

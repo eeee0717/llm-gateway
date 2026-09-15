@@ -5,7 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 
 	"github.com/eeee0717/llm-gateway/internal/config"
@@ -43,7 +45,7 @@ func TestLoadReadsSecretsFromEnv(t *testing.T) {
 	require.Equal(t, &config.Config{
 		Listen:    ":9000",
 		Admin:     config.Admin{Listen: ":9001", KeyEnv: "TEST_ADMIN_KEY", Key: "admin-secret"},
-		Database:  config.Database{DSNEnv: "TEST_DATABASE_DSN", DSN: "postgres://localhost/test"},
+		Database:  config.Database{DSNEnv: "TEST_DATABASE_DSN", DSN: "gateway:gateway@tcp(localhost:3306)/gateway"},
 		Redis:     config.Redis{URLEnv: "TEST_REDIS_URL", URL: "redis://localhost:6379/0"},
 		RateLimit: config.RateLimit{DefaultRPM: 60},
 		Upstreams: []config.Upstream{{
@@ -124,7 +126,7 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 func setenv(t *testing.T) {
 	t.Helper()
 	t.Setenv("TEST_DEEPSEEK_KEY", "sk-upstream")
-	t.Setenv("TEST_DATABASE_DSN", "postgres://localhost/test")
+	t.Setenv("TEST_DATABASE_DSN", "gateway:gateway@tcp(localhost:3306)/gateway")
 	t.Setenv("TEST_ADMIN_KEY", "admin-secret")
 	t.Setenv("TEST_REDIS_URL", "redis://localhost:6379/0")
 }
@@ -134,4 +136,26 @@ func writeConfig(t *testing.T, content string) string {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 	return path
+}
+
+// 连接串上这几个开关缺一个就是一类难查的故障：时间列扫不进 time.Time、时间按本地时区落库、
+// 免费模型的预扣被当成余额不够。所以开连接之前由代码补齐，而不是靠人记得写。
+func TestNormalizeDSNTurnsOnTheFlagsTheGatewayNeeds(t *testing.T) {
+	got, err := config.NormalizeDSN("gateway:gateway@tcp(localhost:3306)/gateway")
+
+	require.NoError(t, err)
+	cfg, err := mysql.ParseDSN(got)
+	require.NoError(t, err)
+	require.True(t, cfg.ParseTime)
+	require.True(t, cfg.ClientFoundRows)
+	require.Equal(t, time.UTC, cfg.Loc)
+	require.Equal(t, "'+00:00'", cfg.Params["time_zone"])
+	require.Equal(t, "gateway", cfg.DBName) // 其余部分原样保留
+}
+
+// 连接串写错时在启动时就说清楚，而不是等第一条查询。
+func TestNormalizeDSNRejectsAConnectionStringItCannotParse(t *testing.T) {
+	_, err := config.NormalizeDSN("postgres://gateway@localhost:5432/gateway")
+
+	require.ErrorContains(t, err, "database dsn")
 }

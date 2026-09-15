@@ -1,4 +1,4 @@
-# 默认只起网关依赖的 PostgreSQL 和 Redis，本地开发和 go test 连的就是这一套：
+# 默认只起网关依赖的 MySQL 和 Redis，本地开发和 go test 连的就是这一套：
 #   docker compose up -d
 # 加上 full 这个 profile 会连网关、mock 上游一起起来，不需要任何真实密钥：
 #   docker compose --profile full up -d --build
@@ -13,28 +13,29 @@ x-gateway: &gateway
   volumes:
     - ./config.compose.yaml:/etc/gateway/config.yaml:ro
   environment:
-    DATABASE_DSN: postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable
+    DATABASE_DSN: gateway:gateway@tcp(mysql:3306)/gateway
     REDIS_URL: redis://redis:6379/0
     ADMIN_KEY: ${ADMIN_KEY:-local-admin-key}
     MOCK_API_KEY: mock
 
 services:
-  postgres:
-    image: postgres:18-alpine
+  mysql:
+    image: mysql:8.4
     environment:
-      POSTGRES_USER: gateway
-      POSTGRES_PASSWORD: gateway
-      POSTGRES_DB: gateway
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: gateway
+      MYSQL_USER: gateway
+      MYSQL_PASSWORD: gateway
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:3306:3306"
     volumes:
-      # PG 18 起数据目录在 /var/lib/postgresql 下按主版本号分子目录，卷要挂在上一层
-      - pgdata:/var/lib/postgresql
+      - mysqldata:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      # 用 mysqladmin ping 不够：口令错了它照样答"alive"。这条要真连上库、真查一次。
+      test: ["CMD", "mysql", "-ugateway", "-pgateway", "-e", "SELECT 1", "gateway"]
       interval: 2s
       timeout: 3s
-      retries: 15
+      retries: 30
 
   redis:
     image: redis:8-alpine
@@ -61,7 +62,7 @@ services:
     <<: *gateway
     command: ["migrate", "-config", "/etc/gateway/config.yaml"]
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
     restart: "no"
 
@@ -77,4 +78,4 @@ services:
         condition: service_healthy
 
 volumes:
-  pgdata:
+  mysqldata:

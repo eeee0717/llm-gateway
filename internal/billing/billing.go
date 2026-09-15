@@ -1,5 +1,5 @@
 // Package billing 按用量计费：转发前预扣最大可能的费用，请求结束后按实际用量结算、多退少补，
-// 并留下一条用量记录。规则见 docs/adr/0001，余额只存在 PostgreSQL 见 docs/adr/0002。
+// 并留下一条用量记录。规则见 docs/adr/0001，余额只存在 MySQL 见 docs/adr/0002。
 package billing
 
 import (

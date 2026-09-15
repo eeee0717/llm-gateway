@@ -7,8 +7,9 @@ admin:
   key_env: ADMIN_KEY
 
 # 本地依赖由 docker compose up -d 提供，对应的连接串是：
-#   export DATABASE_DSN='postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable'
+#   export DATABASE_DSN='gateway:gateway@tcp(localhost:3306)/gateway'
 #   export REDIS_URL='redis://localhost:6379/0'
+# 连接串用 go-sql-driver 的格式；parseTime、时区和 clientFoundRows 这几个开关由网关自己补上。
 database:
   dsn_env: DATABASE_DSN
 

@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -29,10 +31,36 @@ type Admin struct {
 	Key    string `yaml:"-"`       // 管理员密钥，加载时从 KeyEnv 读出
 }
 
-// Database 是 PostgreSQL 的连接配置。连接串里带口令，所以和上游密钥一样只写环境变量名。
+// Database 是 MySQL 的连接配置。连接串里带口令，所以和上游密钥一样只写环境变量名。
+// 连接串用 go-sql-driver 的格式，例如 gateway:gateway@tcp(localhost:3306)/gateway。
 type Database struct {
 	DSNEnv string `yaml:"dsn_env"` // 存放连接串的环境变量名
 	DSN    string `yaml:"-"`       // 连接串，加载时从 DSNEnv 读出
+}
+
+// NormalizeDSN 把连接串补成网关要求的样子。开连接之前调用，它解析连接串、打开几个开关再拼回去。
+//
+// 这几个开关不是可选项，写漏一个就是一类难查的故障，所以由代码补上，而不是写在文档里靠人记：
+//
+//   - parseTime：不开的话 DATETIME 到 Go 这边是一串字节，扫不进 time.Time。
+//   - loc=UTC 与 time_zone='+00:00'：DATETIME 自己不带时区，两端都锁死 UTC，
+//     落库的时间才不会随网关实例所在的时区变。
+//   - clientFoundRows：让 RowsAffected 数的是"WHERE 匹配到几行"，而不是 MySQL 默认的"改动了几行"。
+//     预扣靠这个数判断余额够不够（见 internal/billing），而免费模型的预扣金额是 0，
+//     那条 UPDATE 什么也没改动，按默认语义会被当成"余额不够"，请求平白被拒。
+func NormalizeDSN(dsn string) (string, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("database dsn: %w", err)
+	}
+	cfg.ParseTime = true
+	cfg.Loc = time.UTC
+	cfg.ClientFoundRows = true
+	if cfg.Params == nil {
+		cfg.Params = make(map[string]string, 1)
+	}
+	cfg.Params["time_zone"] = "'+00:00'"
+	return cfg.FormatDSN(), nil
 }
 
 // Redis 是 Redis 的连接配置。连接串里可能带口令，所以和数据库一样只写环境变量名，

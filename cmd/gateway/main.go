@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"gorm.io/driver/postgres"
+	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
@@ -93,9 +93,16 @@ func migrate(args []string) error {
 	return nil
 }
 
-// openDB 连接 PostgreSQL。GORM 自带的日志会直接打到标准输出、和 JSON 日志混在一起，所以关掉。
+// openDB 连接 MySQL。GORM 自带的日志会直接打到标准输出、和 JSON 日志混在一起，所以关掉。
+//
+// TranslateError 把驱动的错误码翻译成 GORM 的错误（这里要的是主键冲突 gorm.ErrDuplicatedKey），
+// 结算靠它认出"这个请求已经结算过"，见 internal/billing。
 func openDB(dsn string) (*gorm.DB, error) {
-	gdb, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: gormlogger.Discard})
+	dsn, err := config.NormalizeDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	gdb, err := gorm.Open(mysql.Open(dsn), &gorm.Config{Logger: gormlogger.Discard, TranslateError: true})
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +110,7 @@ func openDB(dsn string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 一个实例最多占 20 条连接。PostgreSQL 默认只允许 100 条，多起几个实例也不会把连接占满；
+	// 一个实例最多占 20 条连接。MySQL 默认允许 151 条，多起几个实例也不会把连接占满；
 	// 并发再高也只是在这 20 条上排队，预扣本来就是同一行上的串行操作。
 	db.SetMaxOpenConns(20)
 	db.SetMaxIdleConns(10)

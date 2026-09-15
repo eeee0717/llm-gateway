@@ -21,9 +21,11 @@ func TestSchemaStoresKeysAndUsageRecords(t *testing.T) {
 		Disabled     bool
 		CreatedAt    time.Time
 	}
+	hash := rand.Text()
+	require.NoError(t, insertKey(db, hash))
+	// MySQL 没有 RETURNING，插完再按哈希读回来。
 	require.NoError(t, db.Raw(
-		`INSERT INTO api_keys (name, key_hash) VALUES (?, ?) RETURNING id, balance_micro, disabled, created_at`,
-		"test key", rand.Text(),
+		`SELECT id, balance_micro, disabled, created_at FROM api_keys WHERE key_hash = ?`, hash,
 	).Scan(&key).Error)
 
 	require.NotZero(t, key.ID)
